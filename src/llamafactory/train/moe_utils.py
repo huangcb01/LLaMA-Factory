@@ -118,11 +118,11 @@ def update_moe_num_experts(model: "torch.nn.Module", num_experts: int) -> bool:
                 if hasattr(layer, "block_sparse_moe"):
                     moe_block = layer.block_sparse_moe
                 elif hasattr(layer, "mlp"):
-                    if hasattr(layer.mlp, "num_experts_per_tok"):
+                    if hasattr(layer.mlp, "top_k"):
                         moe_block = layer.mlp
 
-                if moe_block is not None and hasattr(moe_block, "num_experts_per_tok"):
-                    moe_block.num_experts_per_tok = num_experts
+                if moe_block is not None and hasattr(moe_block, "top_k"):
+                    moe_block.top_k = num_experts
 
     if not updated:
         logger.warning_rank0(
