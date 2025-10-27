@@ -94,10 +94,10 @@ def _setup_freeze_tuning(
     hidden_modules = set()
     non_hidden_modules = set()
     for name, _ in model.named_parameters():
-        if ".0." in name:
-            hidden_modules.add(name.split(".0.")[-1].split(".")[0])
-        elif ".1." in name:  # MoD starts from layer 1
-            hidden_modules.add(name.split(".1.")[-1].split(".")[0])
+        if ".layers.0." in name:
+            hidden_modules.add(".".join(name.split(".layers.0.")[-1].split(".")[:-1]))
+        elif ".layers.1." in name:  # MoD starts from layer 1
+            hidden_modules.add(".".join(name.split(".layers.1.")[-1].split(".")[:-1]))
 
         if re.search(r"\.\d+\.", name) is None:
             non_hidden_modules.add(name.split(".")[-2])  # remove weight/bias
