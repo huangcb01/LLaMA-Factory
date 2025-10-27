@@ -517,6 +517,14 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether or not to compute effective tokens per second."},
     )
+    moe_progressive_expert_reduction: bool = field(
+        default=False,
+        metadata={"help": "Whether to progressively reduce the number of activated experts in MoE models during SFT training. Initial number will be all experts, final number will be the model's default num_experts_per_tok."},
+    )
+    moe_expert_reduction_steps: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of training steps between each expert reduction. If None, will be computed based on total training steps."},
+    )
 
     def __post_init__(self):
         def split_arg(arg):

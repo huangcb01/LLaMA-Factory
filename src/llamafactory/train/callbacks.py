@@ -33,6 +33,7 @@ from ..extras import logging
 from ..extras.constants import TRAINER_LOG, V_HEAD_SAFE_WEIGHTS_NAME, V_HEAD_WEIGHTS_NAME
 from ..extras.misc import get_peak_memory, is_env_enabled, use_ray
 from ..extras.packages import is_safetensors_available
+from .moe_utils import update_moe_num_experts
 
 
 if is_safetensors_available():
@@ -380,3 +381,76 @@ class ReporterCallback(TrainerCallback):
                     "generating_args": self.generating_args.to_dict(),
                 }
             )
+
+
+class MoeExpertReductionCallback(TrainerCallback):
+    r"""
+    A callback for progressively reducing the number of activated experts in MoE models during training.
+
+    This callback starts with a higher number of activated experts and gradually reduces them to the
+    target number over the course of training. This can help with training stability and convergence.
+    """
+
+    def __init__(
+        self,
+        initial_num_experts: int,
+        final_num_experts: int,
+        reduction_steps: int,
+        total_training_steps: int,
+    ) -> None:
+        """
+        Args:
+            initial_num_experts: Starting number of activated experts
+            final_num_experts: Target number of activated experts at the end of training
+            reduction_steps: Number of training steps between each expert reduction
+            total_training_steps: Total number of training steps
+        """
+        self.initial_num_experts = initial_num_experts
+        self.final_num_experts = final_num_experts
+        self.reduction_steps = reduction_steps
+        self.total_training_steps = total_training_steps
+        self.current_num_experts = initial_num_experts
+
+        # Calculate the number of reductions needed
+        self.num_reductions = initial_num_experts - final_num_experts
+
+        logger.info_rank0(
+            f"MoE Expert Reduction initialized: "
+            f"from {initial_num_experts} to {final_num_experts} experts, "
+            f"reduction every {reduction_steps} steps"
+        )
+
+    @override
+    def on_train_begin(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        """Initialize the expert count at the beginning of training."""
+        model = kwargs.get("model")
+        if model is not None:
+            update_moe_num_experts(model, self.current_num_experts)
+            logger.info_rank0(f"Starting MoE training with {self.current_num_experts} activated experts")
+
+    @override
+    def on_step_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
+        """Check if we should reduce the number of experts at this step."""
+        if self.current_num_experts <= self.final_num_experts:
+            return
+
+        current_step = state.global_step
+
+        # Check if it's time to reduce the number of experts
+        if current_step > 0 and current_step % self.reduction_steps == 0:
+            # Calculate how many experts we should have at this point
+            num_reductions_done = current_step // self.reduction_steps
+            target_experts = max(
+                self.final_num_experts,
+                self.initial_num_experts - num_reductions_done
+            )
+
+            # Only update if we need to reduce
+            if target_experts < self.current_num_experts:
+                model = kwargs.get("model")
+                if model is not None:
+                    self.current_num_experts = target_experts
+                    update_moe_num_experts(model, self.current_num_experts)
+                    logger.info_rank0(
+                        f"Step {current_step}: Reduced activated experts to {self.current_num_experts}"
+                    )

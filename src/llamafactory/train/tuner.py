@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.distributed as dist
-from transformers import EarlyStoppingCallback, PreTrainedModel
+from transformers import EarlyStoppingCallback, PreTrainedModel, AutoConfig
 
 from ..data import get_template_and_fix_tokenizer
 from ..extras import logging
@@ -27,9 +27,10 @@ from ..extras.misc import infer_optim_dtype
 from ..extras.packages import is_mcore_adapter_available, is_ray_available
 from ..hparams import get_infer_args, get_ray_args, get_train_args, read_args
 from ..model import load_model, load_tokenizer
-from .callbacks import LogCallback, PissaConvertCallback, ReporterCallback
+from .callbacks import LogCallback, MoeExpertReductionCallback, PissaConvertCallback, ReporterCallback
 from .dpo import run_dpo
 from .kto import run_kto
+from .moe_utils import get_moe_expert_info
 from .ppo import run_ppo
 from .pt import run_pt
 from .rm import run_rm
@@ -63,6 +64,67 @@ def _training_function(config: dict[str, Any]) -> None:
 
     if finetuning_args.early_stopping_steps is not None:
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=finetuning_args.early_stopping_steps))
+
+    # Add MoE expert reduction callback if enabled
+    if finetuning_args.moe_progressive_expert_reduction:
+        # Load only the model config to check MoE parameters (avoid loading full model weights)
+        try:
+            config = AutoConfig.from_pretrained(
+                model_args.model_name_or_path,
+                cache_dir=model_args.cache_dir,
+                revision=model_args.model_revision,
+                token=model_args.hf_hub_token,
+                trust_remote_code=model_args.trust_remote_code,
+            )
+
+            # Use the utility function to get expert info
+            default_num_experts, num_experts = get_moe_expert_info(config)
+
+            if default_num_experts is not None and num_experts is not None:
+                # Use all experts as initial, model default as final
+                initial_num_experts = num_experts
+                final_num_experts = default_num_experts
+
+                if initial_num_experts > final_num_experts:
+                    # Calculate reduction steps
+                    if finetuning_args.moe_expert_reduction_steps is not None:
+                        reduction_steps = finetuning_args.moe_expert_reduction_steps
+                    else:
+                        # Auto-calculate based on total training steps
+                        num_reductions = initial_num_experts - final_num_experts
+                        reduction_steps = max(1, training_args.max_steps // (num_reductions + 1))
+
+                    callbacks.append(
+                        MoeExpertReductionCallback(
+                            initial_num_experts=initial_num_experts,
+                            final_num_experts=final_num_experts,
+                            reduction_steps=reduction_steps,
+                            total_training_steps=training_args.max_steps,
+                        )
+                    )
+                    logger.info_rank0(
+                        f"MoE progressive expert reduction enabled: "
+                        f"{initial_num_experts} -> {final_num_experts} experts, "
+                        f"reduction every {reduction_steps} steps"
+                    )
+                else:
+                    logger.warning_rank0(
+                        f"MoE progressive expert reduction is enabled but the model already uses "
+                        f"all experts ({initial_num_experts} == {final_num_experts}). "
+                        f"Skipping MoE expert reduction."
+                    )
+            else:
+                model_type = getattr(config, "model_type", None)
+                logger.warning_rank0(
+                    f"MoE progressive expert reduction is enabled but model type '{model_type}' "
+                    f"does not appear to be a supported MoE model or config is missing required fields. "
+                    f"Skipping MoE expert reduction."
+                )
+        except Exception as e:
+            logger.warning_rank0(
+                f"Failed to load model config for MoE expert reduction: {e}. "
+                f"Skipping MoE expert reduction."
+            )
 
     callbacks.append(ReporterCallback(model_args, data_args, finetuning_args, generating_args))  # add to last
 
