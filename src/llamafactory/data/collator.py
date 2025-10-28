@@ -107,8 +107,12 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
         batch_images, batch_videos, batch_audios = [], [], []
+        # Extract optional dataset tags from features to avoid tensorization of strings
+        batch_dataset = []
         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
         for feature in features:
+            if "dataset" in feature:
+                batch_dataset.append(feature.pop("dataset"))
             images = feature.pop("images", None) or []
             videos = feature.pop("videos", None) or []
             audios = feature.pop("audios", None) or []
@@ -236,8 +240,13 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
         if "image_bound" in features:  # for minicpmv inputs
             bsz, seq_length = features["input_ids"].shape
             features["position_ids"] = torch.arange(seq_length).long().repeat(bsz, 1)
-            return {"data": features, "input_ids": features["input_ids"], "labels": features["labels"]}
+            batch = {"data": features, "input_ids": features["input_ids"], "labels": features["labels"]}
+            if len(batch_dataset) == len(features["input_ids"]):
+                batch["batch_dataset"] = batch_dataset
+            return batch
 
+        if len(batch_dataset) == features["input_ids"].size(0):
+            features["batch_dataset"] = batch_dataset
         return features
 
 

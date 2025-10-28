@@ -525,6 +525,20 @@ class FinetuningArguments(
         default=None,
         metadata={"help": "Number of training steps between each expert reduction. If None, will be computed based on total training steps."},
     )
+    # Per-dataset gradient monitoring & scaling (SFT specific)
+    record_per_dataset_grad_norm: bool = field(
+        default=False,
+        metadata={"help": "Whether to record mean gradient norm per dataset during training (SFT)."},
+    )
+    per_dataset_grad_scale: Optional[dict[str, float] | str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Per-dataset gradient scaling factors in the format 'name1:scale1,name2:scale2'. "
+                "If provided, gradients from a mini-batch belonging to that dataset will be multiplied by the scale."
+            )
+        },
+    )
 
     def __post_init__(self):
         def split_arg(arg):
@@ -582,6 +596,20 @@ class FinetuningArguments(
 
             if self.pissa_init:
                 raise ValueError("`pissa_init` is only valid for LoRA training.")
+
+        # Parse per-dataset grad scale string into dict if needed
+        if isinstance(self.per_dataset_grad_scale, str):
+            try:
+                mapping: dict[str, float] = {}
+                items = [item.strip() for item in self.per_dataset_grad_scale.split(",") if item.strip()]
+                for it in items:
+                    name, val = it.split(":", 1)
+                    mapping[name.strip()] = float(val.strip())
+                self.per_dataset_grad_scale = mapping
+            except Exception as e:
+                raise ValueError(
+                    f"Invalid per_dataset_grad_scale format: {self.per_dataset_grad_scale}. Expected 'name:scale,...'"
+                ) from e
 
     def to_dict(self) -> dict[str, Any]:
         args = asdict(self)

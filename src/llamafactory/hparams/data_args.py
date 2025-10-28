@@ -71,6 +71,16 @@ class DataArguments:
         default=None,
         metadata={"help": "Probabilities to sample data from datasets. Use commas to separate multiple datasets."},
     )
+    sft_batch_mix_probs: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Per-batch sampling ratios for each training dataset during SFT. "
+                "Use commas to separate multiple datasets. When used together with per-dataset gradient logging or scaling, "
+                "these ratios determine the frequency of pure mini-batches per dataset."
+            )
+        },
+    )
     overwrite_cache: bool = field(
         default=False,
         metadata={"help": "Overwrite the cached training and evaluation sets."},
@@ -166,6 +176,12 @@ class DataArguments:
 
             if self.eval_dataset is not None and len(self.eval_dataset) != len(self.interleave_probs):
                 raise ValueError("The length of eval dataset and interleave probs should be identical.")
+
+        # Parse per-batch SFT mixing probabilities (optional)
+        if self.sft_batch_mix_probs is not None:
+            self.sft_batch_mix_probs = list(map(float, split_arg(self.sft_batch_mix_probs)))
+            if self.dataset is not None and len(self.dataset) != len(self.sft_batch_mix_probs):
+                raise ValueError("The length of dataset and sft_batch_mix_probs should be identical.")
 
         if self.streaming and self.val_size > 1e-6 and self.val_size < 1:
             raise ValueError("Streaming mode should have an integer val size.")

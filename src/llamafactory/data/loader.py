@@ -179,7 +179,23 @@ def _get_merged_dataset(
         if (stage == "rm" and dataset_attr.ranking is False) or (stage != "rm" and dataset_attr.ranking is True):
             raise ValueError("The dataset is not applicable in the current training stage.")
 
-        datasets[dataset_name] = _load_single_dataset(dataset_attr, model_args, data_args, training_args)
+        ds = _load_single_dataset(dataset_attr, model_args, data_args, training_args)
+        # Tag dataset origin to enable per-dataset sampling and grad logging later
+        try:
+            if hasattr(ds, "add_column"):  # map-style dataset
+                from datasets import Dataset as HFDataset
+
+                if isinstance(ds, HFDataset):
+                    ds = ds.add_column("__dataset_name", [dataset_name] * len(ds))
+                else:  # potential other dataset types supporting add_column
+                    ds = ds.map(lambda x: {"__dataset_name": dataset_name})
+            else:  # iterable dataset
+                ds = ds.map(lambda x: {"__dataset_name": dataset_name})
+        except Exception:
+            # Best effort; if tagging fails we continue without it
+            pass
+
+        datasets[dataset_name] = ds
 
     if return_dict:
         return datasets

@@ -31,6 +31,8 @@ from ...extras.packages import is_transformers_version_greater_than
 from ..callbacks import SaveProcessorCallback
 from ..fp8_utils import configure_fp8_environment, verify_fp8_status
 from ..trainer_utils import create_custom_optimizer, create_custom_scheduler
+from ...data.mixed_batch_sampler import MixedBatchSampler
+import math
 
 
 if TYPE_CHECKING:
@@ -38,7 +40,7 @@ if TYPE_CHECKING:
     from transformers import PreTrainedTokenizer, ProcessorMixin
     from transformers.trainer import PredictionOutput
 
-    from ...hparams import FinetuningArguments, ModelArguments
+    from ...hparams import FinetuningArguments, ModelArguments, DataArguments
 
 
 logger = logging.get_logger(__name__)
@@ -53,6 +55,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         processor: Optional["ProcessorMixin"],
         model_args: Optional["ModelArguments"] = None,
         gen_kwargs: Optional[dict[str, Any]] = None,
+        data_args: Optional["DataArguments"] = None,
         **kwargs,
     ) -> None:
         # Configure FP8 environment if enabled
@@ -69,7 +72,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             # https://github.com/huggingface/transformers/pull/36044#issuecomment-2746657112
             self.model_accepts_loss_kwargs = False
 
-        self.finetuning_args = finetuning_args
+    self.finetuning_args = finetuning_args
+    self.data_args = data_args
         if gen_kwargs is not None:
             # https://github.com/huggingface/transformers/blob/v4.45.0/src/transformers/trainer_seq2seq.py#L287
             self._gen_kwargs = gen_kwargs
@@ -92,6 +96,20 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if model_args is not None and model_args.fp8 and hasattr(self, "accelerator"):
             verify_fp8_status(self.accelerator, model_args)
 
+        # Per-dataset gradient bookkeeping
+        self._enable_per_dataset_grad = bool(
+            getattr(self.finetuning_args, "record_per_dataset_grad_norm", False)
+            or (getattr(self.finetuning_args, "per_dataset_grad_scale", None) is not None)
+        )
+        self._per_dataset_scales = {}
+        if getattr(self.finetuning_args, "per_dataset_grad_scale", None) is not None:
+            # finetuning_args should provide a dict after __post_init__ parsing if user configured it
+            self._per_dataset_scales = self.finetuning_args.per_dataset_grad_scale  # type: ignore[attr-defined]
+
+        self._accum_grads: Optional[list[torch.Tensor]] = None
+        self._per_dataset_grad_norm_sum: dict[str, float] = {}
+        self._per_dataset_grad_norm_cnt: dict[str, int] = {}
+
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
         if self.optimizer is None:
@@ -113,8 +131,156 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return super()._get_train_sampler(*args, **kwargs)
 
     @override
+    def get_train_dataloader(self):
+        # Use custom batch sampler when mixing probs are set or per-dataset grad feature is enabled
+        if (
+            self.train_dataset is None
+            or self.data_args is None
+            or (self.data_args.sft_batch_mix_probs is None and not self._enable_per_dataset_grad)
+        ):
+            return super().get_train_dataloader()
+
+        # Must be map-style to access columns
+        try:
+            dataset_names = list(self.train_dataset["dataset"])  # type: ignore[index]
+        except Exception:
+            return super().get_train_dataloader()
+
+        per_device_bsz = self.args.per_device_train_batch_size
+        world_size = self.args.world_size
+        rank = self.args.process_index
+        shuffle = not self.finetuning_args.disable_shuffling
+        mix_probs = (
+            [float(x) for x in self.data_args.sft_batch_mix_probs]
+            if self.data_args.sft_batch_mix_probs is not None
+            else None
+        )
+        if mix_probs is None:
+            # default uniform over provided datasets order
+            uniq = list(dict.fromkeys(dataset_names))
+            mix_probs = [1.0 / len(uniq)] * len(uniq)
+        dataset_order = self.data_args.dataset or list(dict.fromkeys(dataset_names))
+        mode = "pure" if self._enable_per_dataset_grad else "mixed"
+
+        batch_sampler = MixedBatchSampler(
+            dataset=self.train_dataset,
+            dataset_field="dataset",
+            per_device_batch_size=per_device_bsz,
+            mix_probs=mix_probs,
+            dataset_order=dataset_order,  # type: ignore[arg-type]
+            mode=mode,
+            shuffle=shuffle,
+            drop_last=self.args.dataloader_drop_last,
+            world_size=world_size,
+            rank=rank,
+        )
+
+        return torch.utils.data.DataLoader(
+            self.train_dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=self.data_collator,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+            persistent_workers=self.args.dataloader_persistent_workers,
+        )
+
+    @override
     def compute_loss(self, model, inputs, *args, **kwargs):
         return super().compute_loss(model, inputs, *args, **kwargs)
+
+    @override
+    def training_step(self, model: "torch.nn.Module", inputs: dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        # Extract dataset tags and avoid forwarding to model
+        batch_dataset = inputs.pop("batch_dataset", None)
+        dataset_name = None
+        if isinstance(batch_dataset, list) and len(batch_dataset) > 0:
+            dataset_name = str(batch_dataset[0])
+
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()
+
+        if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
+            loss = loss / self.args.gradient_accumulation_steps
+
+        # Backward for this micro-batch
+        self.accelerator.backward(loss)
+
+        # If not enabled, use default accumulation behavior
+        if not self._enable_per_dataset_grad:
+            return loss.detach()
+
+        # Compute grad norm (pre-scaling) and reduce across ranks
+        if bool(getattr(self.finetuning_args, "record_per_dataset_grad_norm", False)) and dataset_name is not None:
+            total_norm_sq = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.float().norm(2)
+                    total_norm_sq += float(param_norm.item() ** 2)
+            total_norm = math.sqrt(max(total_norm_sq, 0.0))
+            try:
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    t = torch.tensor(total_norm, device=loss.device, dtype=torch.float32)
+                    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+                    total_norm = (t / self.args.world_size).item()
+            except Exception:
+                pass
+            self._per_dataset_grad_norm_sum[dataset_name] = (
+                self._per_dataset_grad_norm_sum.get(dataset_name, 0.0) + total_norm
+            )
+            self._per_dataset_grad_norm_cnt[dataset_name] = self._per_dataset_grad_norm_cnt.get(dataset_name, 0) + 1
+
+        # Scale grads per dataset if configured
+        scale = 1.0
+        if dataset_name is not None and dataset_name in self._per_dataset_scales:
+            try:
+                scale = float(self._per_dataset_scales[dataset_name])
+            except Exception:
+                scale = 1.0
+        if abs(scale - 1.0) > 1e-8:
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.data.mul_(scale)
+
+        # Accumulate grads into buffer and clear param grads
+        if self._accum_grads is None:
+            self._accum_grads = [
+                (p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p, device=p.device))
+                for p in model.parameters()
+            ]
+        else:
+            for buf, p in zip(self._accum_grads, model.parameters()):
+                if p.grad is not None:
+                    buf.add_(p.grad)
+
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad = None
+
+        # On update step, restore accumulated grads to parameters so HF can clip/step
+        if self.accelerator.sync_gradients:
+            if self._accum_grads is not None:
+                for buf in self._accum_grads:
+                    buf.div_(self.args.gradient_accumulation_steps)
+                for buf, p in zip(self._accum_grads, model.parameters()):
+                    p.grad = buf
+            # Log per-dataset grad norm means
+            if self.state.global_step > 0 and (self.state.global_step % self.args.logging_steps == 0):
+                metrics = {}
+                for name, s in self._per_dataset_grad_norm_sum.items():
+                    cnt = max(1, self._per_dataset_grad_norm_cnt.get(name, 1))
+                    metrics[f"grad_norm/{name}"] = s / cnt
+                if len(metrics):
+                    self.log(metrics)
+            # reset buffer; .grad will be cleared by HF later
+            self._accum_grads = None
+
+        return loss.detach()
 
     @override
     def prediction_step(

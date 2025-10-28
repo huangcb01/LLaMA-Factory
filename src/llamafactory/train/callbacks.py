@@ -271,20 +271,25 @@ class LogCallback(TrainerCallback):
             return
 
         self._timing(cur_steps=state.global_step)
+        latest = state.log_history[-1]
         logs = dict(
             current_steps=self.cur_steps,
             total_steps=self.max_steps,
-            loss=state.log_history[-1].get("loss"),
-            eval_loss=state.log_history[-1].get("eval_loss"),
-            predict_loss=state.log_history[-1].get("predict_loss"),
-            reward=state.log_history[-1].get("reward"),
-            accuracy=state.log_history[-1].get("rewards/accuracies"),
-            lr=state.log_history[-1].get("learning_rate"),
-            epoch=state.log_history[-1].get("epoch"),
+            loss=latest.get("loss"),
+            eval_loss=latest.get("eval_loss"),
+            predict_loss=latest.get("predict_loss"),
+            reward=latest.get("reward"),
+            accuracy=latest.get("rewards/accuracies"),
+            lr=latest.get("learning_rate"),
+            epoch=latest.get("epoch"),
             percentage=round(self.cur_steps / self.max_steps * 100, 2) if self.max_steps != 0 else 100,
             elapsed_time=self.elapsed_time,
             remaining_time=self.remaining_time,
         )
+        # Include extra metrics such as per-dataset grad norms if present
+        for k, v in latest.items():
+            if isinstance(k, str) and (k.startswith("grad_norm/") or k.startswith("grad/")):
+                logs[k] = v
         if state.num_input_tokens_seen:
             logs["throughput"] = round(state.num_input_tokens_seen / (time.time() - self.start_time), 2)
             logs["total_tokens"] = state.num_input_tokens_seen

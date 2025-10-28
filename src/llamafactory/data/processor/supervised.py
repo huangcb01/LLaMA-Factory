@@ -111,6 +111,8 @@ class SupervisedDatasetProcessor(DatasetProcessor):
             model_inputs["images"].append(examples["_images"][i])
             model_inputs["videos"].append(examples["_videos"][i])
             model_inputs["audios"].append(examples["_audios"][i])
+            if "_dataset" in examples:
+                model_inputs["dataset"].append(examples["_dataset"][i])
 
         return model_inputs
 

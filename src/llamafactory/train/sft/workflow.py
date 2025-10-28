@@ -48,6 +48,12 @@ def run_sft(
     tokenizer_module = load_tokenizer(model_args)
     tokenizer = tokenizer_module["tokenizer"]
     template = get_template_and_fix_tokenizer(tokenizer, data_args)
+    # If per-dataset grad logging/scaling is enabled, disable packing to simplify pure mini-batch semantics
+    if getattr(finetuning_args, "record_per_dataset_grad_norm", False) or (
+        getattr(finetuning_args, "per_dataset_grad_scale", None) is not None
+    ):
+        data_args.packing = False
+
     dataset_module = get_dataset(template, model_args, data_args, training_args, stage="sft", **tokenizer_module)
     model = load_model(tokenizer, model_args, finetuning_args, training_args.do_train)
 
@@ -83,6 +89,7 @@ def run_sft(
         model=model,
         args=training_args,
         finetuning_args=finetuning_args,
+        data_args=data_args,
         data_collator=data_collator,
         callbacks=callbacks,
         gen_kwargs=gen_kwargs,
