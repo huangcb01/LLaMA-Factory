@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -36,31 +37,51 @@ class GoldRouterLogitsLoader:
         self.logits_cache = {}  # Cache loaded logits files
         self.dataset_to_file = {}  # Map dataset name to logits file
 
-        if data_args.gold_router_logits_path is not None:
+        if data_args.gold_router_logits_dir is not None:
             self._initialize_mappings()
 
     def _initialize_mappings(self):
         """Initialize mappings between datasets and gold router logits files."""
         datasets = self.data_args.dataset if self.data_args.dataset is not None else []
-        logits_paths = self.data_args.gold_router_logits_path if self.data_args.gold_router_logits_path is not None else []
 
-        if len(logits_paths) == 0:
+        if len(datasets) == 0:
             return
 
-        if len(logits_paths) == 1 and len(datasets) > 1:
-            # Use the same logits file for all datasets
-            for dataset_name in datasets:
-                self.dataset_to_file[dataset_name] = logits_paths[0]
-        elif len(logits_paths) == len(datasets):
-            # One-to-one mapping
-            for dataset_name, logits_path in zip(datasets, logits_paths):
-                if logits_path:  # Skip empty paths
-                    self.dataset_to_file[dataset_name] = logits_path
-        else:
-            raise ValueError(
-                f"Number of gold_router_logits_path ({len(logits_paths)}) must be 1 or equal to "
-                f"number of datasets ({len(datasets)})."
-            )
+        # Load dataset_info.json to get dataset file names
+        dataset_info_path = os.path.join(self.data_args.dataset_dir, "dataset_info.json")
+        if not os.path.exists(dataset_info_path):
+            logger.warning_rank0(f"dataset_info.json not found at {dataset_info_path}")
+            return
+
+        try:
+            with open(dataset_info_path, "r", encoding="utf-8") as f:
+                dataset_info = json.load(f)
+        except Exception as e:
+            logger.warning_rank0(f"Failed to load dataset_info.json: {e}")
+            return
+
+        # Map each dataset to its corresponding logits file
+        for dataset_name in datasets:
+            if dataset_name not in dataset_info:
+                logger.warning_rank0(f"Dataset '{dataset_name}' not found in dataset_info.json")
+                continue
+
+            dataset_file_name = dataset_info[dataset_name].get("file_name")
+            if not dataset_file_name:
+                logger.warning_rank0(f"No file_name specified for dataset '{dataset_name}' in dataset_info.json")
+                continue
+
+            # Get base name without extension and add .npz
+            base_name = os.path.splitext(dataset_file_name)[0]
+            logits_file = f"{base_name}.npz"
+
+            # Check if the file exists in the gold_router_logits_dir
+            logits_path = os.path.join(self.data_args.gold_router_logits_dir, logits_file)
+            if os.path.exists(logits_path):
+                self.dataset_to_file[dataset_name] = logits_file
+                logger.info_rank0(f"Found gold router logits for dataset '{dataset_name}': {logits_file}")
+            else:
+                logger.warning_rank0(f"Gold router logits file not found for dataset '{dataset_name}': {logits_path}")
 
         logger.info_rank0(f"Gold router logits mappings: {self.dataset_to_file}")
 
@@ -69,7 +90,7 @@ class GoldRouterLogitsLoader:
         if logits_path in self.logits_cache:
             return self.logits_cache[logits_path]
 
-        full_path = os.path.join(self.data_args.dataset_dir, logits_path)
+        full_path = os.path.join(self.data_args.gold_router_logits_dir, logits_path)
         if not os.path.exists(full_path):
             logger.warning_rank0(f"Gold router logits file not found: {full_path}")
             return None
@@ -110,22 +131,14 @@ class GoldRouterLogitsLoader:
 _global_loader: Optional[GoldRouterLogitsLoader] = None
 
 
-def initialize_gold_router_loader(data_args: Union["DataArguments", dict[str, str]]):
+def initialize_gold_router_loader(data_args: "DataArguments"):
     """Initialize the global gold router logits loader.
 
     Args:
-        data_args: Can be either DataArguments object or a dict mapping dataset names to logits paths.
+        data_args: DataArguments object containing dataset and gold_router_logits_dir configuration.
     """
     global _global_loader
-    if isinstance(data_args, dict):
-        # Create a mock DataArguments with the provided mapping
-        from types import SimpleNamespace
-        mock_args = SimpleNamespace()
-        mock_args.dataset = ",".join(data_args.keys())
-        mock_args.gold_router_logits_path = ",".join(data_args.values())
-        _global_loader = GoldRouterLogitsLoader(mock_args)  # type: ignore
-    else:
-        _global_loader = GoldRouterLogitsLoader(data_args)
+    _global_loader = GoldRouterLogitsLoader(data_args)
 
 
 def get_gold_router_loader() -> Optional[GoldRouterLogitsLoader]:

@@ -137,12 +137,12 @@ class DataArguments:
         default=False,
         metadata={"help": "Whether or not to use a shared file system for the datasets."},
     )
-    gold_router_logits_path: Optional[str] = field(
+    gold_router_logits_dir: Optional[str] = field(
         default=None,
         metadata={
             "help": (
-                "Path to the gold router logits file (NPZ format) for MoE auxiliary loss. "
-                "Use commas to separate multiple files corresponding to multiple datasets."
+                "Directory containing gold router logits files (NPZ format) for MoE auxiliary loss. "
+                "The system will automatically look for files with names matching the dataset filenames."
             )
         },
     )
@@ -155,7 +155,6 @@ class DataArguments:
 
         self.dataset = split_arg(self.dataset)
         self.eval_dataset = split_arg(self.eval_dataset)
-        self.gold_router_logits_path = split_arg(self.gold_router_logits_path)
 
         if self.media_dir is None:
             self.media_dir = self.dataset_dir

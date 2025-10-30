@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 from typing import TYPE_CHECKING, Optional, cast
 
@@ -39,7 +40,7 @@ def extract_olmoe_routing(
     template: str = "default",
     cutoff_len: int = 2048,
     max_samples: Optional[int] = None,
-    save_name: str = "olmoe_routing_outputs.npz",
+    output_dir: str = "routing_outputs",
     batch_size: int = 1,
     default_system: Optional[str] = None,
 ):
@@ -57,7 +58,7 @@ def extract_olmoe_routing(
         template: Template name for processing the data
         cutoff_len: Maximum sequence length for input
         max_samples: Maximum number of samples to process (None for all)
-        save_name: Output file name for saving routing results (NPZ format)
+        output_dir: Output directory for saving routing results
         batch_size: Batch size for processing (recommend 1 for OLMoE due to memory)
         default_system: Default system message to use in the template
 
@@ -66,13 +67,33 @@ def extract_olmoe_routing(
             --model_name_or_path allenai/OLMoE-1B-7B-0924 \
             --dataset alpaca_en_demo \
             --template default \
-            --save_name olmoe_routing_outputs.npz
+            --output_dir routing_outputs
     """
+    # Get dataset file name from dataset_info.json
+    dataset_info_path = os.path.join(dataset_dir, "dataset_info.json")
+    if not os.path.exists(dataset_info_path):
+        raise FileNotFoundError(f"dataset_info.json not found at {dataset_info_path}")
+
+    with open(dataset_info_path, "r", encoding="utf-8") as f:
+        dataset_info = json.load(f)
+
+    if dataset not in dataset_info:
+        raise ValueError(f"Dataset '{dataset}' not found in dataset_info.json")
+
+    dataset_file_name = dataset_info[dataset].get("file_name")
+    if not dataset_file_name:
+        raise ValueError(f"No file_name specified for dataset '{dataset}' in dataset_info.json")
+
+    # Create output file path with same name as dataset file (but .npz extension)
+    base_name = os.path.splitext(dataset_file_name)[0]
+    save_name = os.path.join(output_dir, f"{base_name}.npz")
+
     print("=" * 80)
     print("OLMoE Routing Extraction Script")
     print("=" * 80)
     print(f"Model: {model_name_or_path}")
     print(f"Dataset: {dataset}")
+    print(f"Dataset file: {dataset_file_name}")
     print(f"Template: {template}")
     print(f"Output file: {save_name}")
     print("=" * 80)
@@ -188,9 +209,9 @@ def extract_olmoe_routing(
 
     # Save results
     print(f"\n[5/5] Saving results to {save_name}...")
-    output_dir = os.path.dirname(save_name)
-    if output_dir and not os.path.exists(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
+    save_dir = os.path.dirname(save_name)
+    if save_dir and not os.path.exists(save_dir):
+        os.makedirs(save_dir, exist_ok=True)
 
     # Prepare data for NPZ format - store by sample
     save_dict = {}

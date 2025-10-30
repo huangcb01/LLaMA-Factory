@@ -337,20 +337,10 @@ def get_dataset(
     processor: Optional["ProcessorMixin"] = None,
 ) -> "DatasetModule":
     r"""Get the train dataset and optionally gets the evaluation dataset."""
-    # Initialize gold router logits loader if paths are provided
-    if data_args.gold_router_logits_path:
-        dataset_names = data_args.dataset.split(",") if data_args.dataset else []
-        logits_paths = data_args.gold_router_logits_path.split(",")
-
-        if len(logits_paths) != len(dataset_names):
-            raise ValueError(
-                f"Number of gold_router_logits_path ({len(logits_paths)}) must match "
-                f"number of datasets ({len(dataset_names)})"
-            )
-
-        path_mapping = {name.strip(): path.strip() for name, path in zip(dataset_names, logits_paths)}
-        initialize_gold_router_loader(path_mapping)
-        logger.info_rank0(f"Initialized gold router logits loader for {len(path_mapping)} datasets.")
+    # Initialize gold router logits loader if directory is provided
+    if data_args.gold_router_logits_dir:
+        initialize_gold_router_loader(data_args)
+        logger.info_rank0(f"Initialized gold router logits loader with directory: {data_args.gold_router_logits_dir}")
 
     # Load tokenized dataset if path exists
     if data_args.tokenized_path is not None:

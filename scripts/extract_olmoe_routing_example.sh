@@ -15,14 +15,14 @@ MODEL_PATH="allenai/OLMoE-1B-7B-0924"
 DATASET="alpaca_en_demo"
 TEMPLATE="default"
 MAX_SAMPLES=10
-OUTPUT_FILE="olmoe_routing_sample.jsonl"
+OUTPUT_DIR="routing_outputs"
 
 echo ""
 echo "Configuration:"
 echo "  Model: $MODEL_PATH"
 echo "  Dataset: $DATASET"
 echo "  Max samples: $MAX_SAMPLES"
-echo "  Output: $OUTPUT_FILE"
+echo "  Output directory: $OUTPUT_DIR"
 echo ""
 
 # Run extraction
@@ -31,7 +31,7 @@ python scripts/extract_olmoe_routing.py \
     --dataset "$DATASET" \
     --template "$TEMPLATE" \
     --max_samples "$MAX_SAMPLES" \
-    --save_name "$OUTPUT_FILE" \
+    --output_dir "$OUTPUT_DIR" \
     --batch_size 1
 
 echo ""
@@ -39,11 +39,8 @@ echo "====================================="
 echo "Extraction complete!"
 echo "====================================="
 echo ""
-echo "Output file: $OUTPUT_FILE"
+echo "Output saved to: $OUTPUT_DIR/alpaca_en_demo.npz"
 echo ""
 echo "To view the results:"
-echo "  head -n 1 $OUTPUT_FILE | python -m json.tool"
-echo ""
-echo "To analyze expert usage:"
-echo "  python scripts/api_example/analyze_routing.py --input $OUTPUT_FILE"
+echo "  python -c \"import numpy as np; data = np.load('$OUTPUT_DIR/alpaca_en_demo.npz'); print('Samples:', list(data.keys())[:5])\""
 echo ""
