@@ -539,6 +539,10 @@ class FinetuningArguments(
             )
         },
     )
+    record_per_dataset_loss: bool = field(
+        default=False,
+        metadata={"help": "Whether to record mean loss per dataset during training (SFT)."},
+    )
 
     def __post_init__(self):
         def split_arg(arg):

@@ -72,8 +72,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             # https://github.com/huggingface/transformers/pull/36044#issuecomment-2746657112
             self.model_accepts_loss_kwargs = False
 
-    self.finetuning_args = finetuning_args
-    self.data_args = data_args
+        self.finetuning_args = finetuning_args
+        self.data_args = data_args
         if gen_kwargs is not None:
             # https://github.com/huggingface/transformers/blob/v4.45.0/src/transformers/trainer_seq2seq.py#L287
             self._gen_kwargs = gen_kwargs
@@ -109,6 +109,11 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self._accum_grads: Optional[list[torch.Tensor]] = None
         self._per_dataset_grad_norm_sum: dict[str, float] = {}
         self._per_dataset_grad_norm_cnt: dict[str, int] = {}
+
+        # Per-dataset loss bookkeeping
+        self._enable_per_dataset_loss = bool(getattr(self.finetuning_args, "record_per_dataset_loss", False))
+        self._per_dataset_loss_sum: dict[str, float] = {}
+        self._per_dataset_loss_cnt: dict[str, int] = {}
 
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
@@ -208,6 +213,19 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if self.args.gradient_accumulation_steps > 1 and not self.deepspeed:
             loss = loss / self.args.gradient_accumulation_steps
 
+        # Record per-dataset loss if enabled
+        if self._enable_per_dataset_loss and dataset_name is not None:
+            loss_value = float(loss.detach())
+            try:
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    t = torch.tensor(loss_value, device=loss.device, dtype=torch.float32)
+                    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+                    loss_value = (t / self.args.world_size).item()
+            except Exception:
+                pass
+            self._per_dataset_loss_sum[dataset_name] = self._per_dataset_loss_sum.get(dataset_name, 0.0) + loss_value
+            self._per_dataset_loss_cnt[dataset_name] = self._per_dataset_loss_cnt.get(dataset_name, 0) + 1
+
         # Backward for this micro-batch
         self.accelerator.backward(loss)
 
@@ -269,14 +287,22 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                     buf.div_(self.args.gradient_accumulation_steps)
                 for buf, p in zip(self._accum_grads, model.parameters()):
                     p.grad = buf
-            # Log per-dataset grad norm means
+            # Log per-dataset grad norm means and loss means
             if self.state.global_step > 0 and (self.state.global_step % self.args.logging_steps == 0):
                 metrics = {}
                 for name, s in self._per_dataset_grad_norm_sum.items():
                     cnt = max(1, self._per_dataset_grad_norm_cnt.get(name, 1))
                     metrics[f"grad_norm/{name}"] = s / cnt
+                for name, s in self._per_dataset_loss_sum.items():
+                    cnt = max(1, self._per_dataset_loss_cnt.get(name, 1))
+                    metrics[f"loss/{name}"] = s / cnt
                 if len(metrics):
                     self.log(metrics)
+                # Reset counters
+                self._per_dataset_grad_norm_sum.clear()
+                self._per_dataset_grad_norm_cnt.clear()
+                self._per_dataset_loss_sum.clear()
+                self._per_dataset_loss_cnt.clear()
             # reset buffer; .grad will be cleared by HF later
             self._accum_grads = None
 
