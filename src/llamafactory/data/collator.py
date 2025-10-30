@@ -108,10 +108,26 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
         batch_images, batch_videos, batch_audios = [], [], []
         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
+        gold_router_logits_list = []
+
+        #  Load gold router logits if available
+        from .gold_router_loader import get_gold_router_loader
+        loader = get_gold_router_loader()
+
         for feature in features:
             images = feature.pop("images", None) or []
             videos = feature.pop("videos", None) or []
             audios = feature.pop("audios", None) or []
+
+            # Try to load gold router logits if loader is available
+            dataset_name = feature.pop("_dataset_name", None)
+            sample_idx = feature.pop("_sample_idx", None)
+            if loader is not None and dataset_name is not None and sample_idx is not None:
+                if loader.has_gold_logits(dataset_name):
+                    gold_logits = loader.get_sample_logits(dataset_name, sample_idx)
+                    if gold_logits is not None:
+                        gold_router_logits_list.append(gold_logits)
+
             batch_images.extend(images)
             batch_videos.extend(videos)
             batch_audios.extend(audios)
@@ -232,6 +248,11 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             mm_inputs["cross_attention_mask"] = F.pad(cross_attention_mask, (0, 0, 0, 0, 0, seq_len - orig_len))
 
         features.update(mm_inputs)
+
+        # Add gold router logits if available
+        if len(gold_router_logits_list) > 0:
+            # Stack gold logits: [batch_size, num_layers, seq_len, num_experts]
+            features["gold_router_logits"] = torch.stack(gold_router_logits_list, dim=0)
 
         if "image_bound" in features:  # for minicpmv inputs
             bsz, seq_length = features["input_ids"].shape

@@ -485,6 +485,10 @@ class FinetuningArguments(
         default=False,
         metadata={"help": "Whether to use the DFT loss."},
     )
+    moe_router_loss_weight: float = field(
+        default=0.0,
+        metadata={"help": "The weight of the MoE router loss if using gold router top-k."},
+    )
     freeze_vision_tower: bool = field(
         default=True,
         metadata={"help": "Whether ot not to freeze the vision tower in MLLM training."},

@@ -23,6 +23,7 @@ from ..extras.constants import FILEEXT2TYPE
 from ..extras.misc import check_version, has_tokenized_data
 from .converter import align_dataset
 from .data_utils import get_dataset_module, merge_dataset, read_cloud_json, split_dataset
+from .gold_router_loader import initialize_gold_router_loader
 from .parser import get_dataset_list
 from .processor import (
     FeedbackDatasetProcessor,
@@ -179,7 +180,21 @@ def _get_merged_dataset(
         if (stage == "rm" and dataset_attr.ranking is False) or (stage != "rm" and dataset_attr.ranking is True):
             raise ValueError("The dataset is not applicable in the current training stage.")
 
-        datasets[dataset_name] = _load_single_dataset(dataset_attr, model_args, data_args, training_args)
+        dataset = _load_single_dataset(dataset_attr, model_args, data_args, training_args)
+
+        # Add dataset_name and sample_idx metadata to each sample for later gold logits loading
+        if not data_args.streaming:
+            def add_metadata(example, idx):
+                example["_dataset_name"] = dataset_name
+                example["_sample_idx"] = idx
+                return example
+
+            dataset = dataset.map(
+                add_metadata,
+                with_indices=True,
+            )
+
+        datasets[dataset_name] = dataset
 
     if return_dict:
         return datasets
@@ -227,6 +242,39 @@ def _get_dataset_processor(
     return dataset_processor_class(template=template, tokenizer=tokenizer, processor=processor, data_args=data_args)
 
 
+def _add_gold_router_logits(
+    dataset: Union["Dataset", "IterableDataset"],
+    dataset_name: str,
+) -> Union["Dataset", "IterableDataset"]:
+    r"""Add gold router logits to dataset if available."""
+    from .gold_router_loader import get_gold_router_loader
+
+    loader = get_gold_router_loader()
+    if loader is None or not loader.has_gold_logits(dataset_name):
+        return dataset
+
+    def add_logits(examples, indices):
+        # For each sample in the batch, load its gold router logits
+        gold_logits_list = []
+        for idx in indices:
+            logits = loader.get_sample_logits(dataset_name, idx)
+            gold_logits_list.append(logits.numpy())  # Store as numpy for dataset
+
+        examples["gold_router_logits"] = gold_logits_list
+        return examples
+
+    # Add gold logits as a new column
+    dataset = dataset.map(
+        add_logits,
+        batched=True,
+        with_indices=True,
+        desc=f"Adding gold router logits for {dataset_name}",
+    )
+
+    logger.info_rank0(f"Added gold router logits to dataset '{dataset_name}'.")
+    return dataset
+
+
 def _get_preprocessed_dataset(
     dataset: Optional[Union["Dataset", "IterableDataset"]],
     data_args: "DataArguments",
@@ -236,6 +284,7 @@ def _get_preprocessed_dataset(
     tokenizer: "PreTrainedTokenizer",
     processor: Optional["ProcessorMixin"] = None,
     is_eval: bool = False,
+    dataset_name: Optional[str] = None,
 ) -> Optional[Union["Dataset", "IterableDataset"]]:
     r"""Preprocesses the dataset, including format checking and tokenization."""
     if dataset is None:
@@ -261,6 +310,10 @@ def _get_preprocessed_dataset(
         **kwargs,
     )
 
+    # Add gold router logits if available
+    if dataset_name is not None and not data_args.streaming:
+        dataset = _add_gold_router_logits(dataset, dataset_name)
+
     if training_args.should_log:
         try:
             print("eval example:" if is_eval else "training example:")
@@ -284,6 +337,21 @@ def get_dataset(
     processor: Optional["ProcessorMixin"] = None,
 ) -> "DatasetModule":
     r"""Get the train dataset and optionally gets the evaluation dataset."""
+    # Initialize gold router logits loader if paths are provided
+    if data_args.gold_router_logits_path:
+        dataset_names = data_args.dataset.split(",") if data_args.dataset else []
+        logits_paths = data_args.gold_router_logits_path.split(",")
+
+        if len(logits_paths) != len(dataset_names):
+            raise ValueError(
+                f"Number of gold_router_logits_path ({len(logits_paths)}) must match "
+                f"number of datasets ({len(dataset_names)})"
+            )
+
+        path_mapping = {name.strip(): path.strip() for name, path in zip(dataset_names, logits_paths)}
+        initialize_gold_router_loader(path_mapping)
+        logger.info_rank0(f"Initialized gold router logits loader for {len(path_mapping)} datasets.")
+
     # Load tokenized dataset if path exists
     if data_args.tokenized_path is not None:
         if has_tokenized_data(data_args.tokenized_path):
