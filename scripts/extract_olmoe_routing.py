@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import datasets
 import fire
 import numpy as np
 import torch
@@ -38,7 +39,6 @@ class RouterExtractionTrainer(Seq2SeqTrainer):
         self.output_dir_routing = output_dir
         self.dataset_name = dataset_name
         self.all_router_logits = []
-        self.all_sample_indices = []
 
     @override
     def prediction_step(
@@ -53,6 +53,7 @@ class RouterExtractionTrainer(Seq2SeqTrainer):
 
         with torch.no_grad():
             # Forward pass with router outputs
+            original_indices = inputs.pop("original_index")  # Extract original indices
             outputs = model(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
@@ -74,30 +75,31 @@ class RouterExtractionTrainer(Seq2SeqTrainer):
             for i in range(batch_size):
                 # Filter by attention mask: [num_layers, seq_len, num_experts] -> [num_layers, valid_seq_len, num_experts]
                 sample_router_logits = router_logits[:, i, attention_mask[i], :].float().cpu().numpy()
-                self.all_router_logits.append(sample_router_logits)
+
+                # Store with original index for later reordering
+                self.all_router_logits.append((original_indices[i], sample_router_logits))
 
         # Return dummy values (we don't care about loss/predictions)
         return (None, None, None)
 
     def save_router_logits(self):
-        """Save collected router logits to file."""
+        """Save collected router logits to file, restoring original order."""
         if not self.is_world_process_zero():
             return
 
         os.makedirs(self.output_dir_routing, exist_ok=True)
         save_path = os.path.join(self.output_dir_routing, f"{self.dataset_name}.npz")
-
         logger.info(f"Saving router logits to {save_path}")
 
-        # Prepare save dict
+        # Prepare save dict with original order
         save_dict = {}
-        for idx, sample_logits in enumerate(self.all_router_logits):
-            save_dict[f"sample_{idx}"] = sample_logits
+        for original_idx, sample_logits in self.all_router_logits:
+            save_dict[f"sample_{original_idx}"] = sample_logits
 
         # Save as compressed NPZ
         np.savez_compressed(save_path, **save_dict)
 
-        logger.info(f"✓ Successfully saved {len(save_dict)} samples")
+        logger.info(f"✓ Successfully saved {len(save_dict)} samples in original order")
         if save_dict:
             first_sample = list(save_dict.values())[0]
             logger.info(f"  Shape per sample: {first_sample.shape} (num_layers, valid_seq_len, num_experts)")
@@ -180,10 +182,7 @@ def extract_olmoe_routing(
     # Check model type
     model_type = getattr(model.config, "model_type", None)
     if model_type != "olmoe":
-        logger.warning(
-            f"Model type is '{model_type}', not 'olmoe'. "
-            "This script is designed for OLMoE models."
-        )
+        logger.warning(f"Model type is '{model_type}', not 'olmoe'. " "This script is designed for OLMoE models.")
 
     # Process each dataset
     for dataset_idx, current_dataset in enumerate(dataset_names):
@@ -196,7 +195,7 @@ def extract_olmoe_routing(
             dict(
                 model_name_or_path=model_name_or_path,
                 adapter_name_or_path=adapter_name_or_path,
-                dataset=current_dataset,
+                eval_dataset=current_dataset,
                 dataset_dir=dataset_dir,
                 template=template,
                 cutoff_len=cutoff_len,
@@ -231,14 +230,26 @@ def extract_olmoe_routing(
         )
 
         eval_dataset = dataset_module.get("eval_dataset")
-        if eval_dataset is None:
-            eval_dataset = dataset_module.get("train_dataset")
-
-        if eval_dataset is None:
+        if not isinstance(eval_dataset, datasets.Dataset):
             logger.error(f"No dataset available for '{current_dataset}'")
             continue
 
-        logger.info(f"Dataset loaded: {len(eval_dataset)} samples")
+        dataset_len = len(eval_dataset)
+        logger.info(f"Dataset loaded: {dataset_len} samples")
+
+        # Sort dataset by sequence length (longest first) to minimize padding
+        logger.info("Sorting dataset by sequence length to minimize padding...")
+        eval_dataset = eval_dataset.map(
+            lambda x, idx: {"length": len(x["input_ids"]), "original_index": idx},
+            with_indices=True,
+            num_proc=os.cpu_count(),
+        )
+        eval_dataset = eval_dataset.sort("length", reverse=True)
+        lengths = eval_dataset["length"]
+        eval_dataset = eval_dataset.remove_columns("length")
+        logger.info(f"  Longest sequence: {lengths[0]} tokens")
+        logger.info(f"  Shortest sequence: {lengths[-1]} tokens")
+        logger.info(f"  Average length: {sum(lengths) / len(lengths):.1f} tokens")
 
         # Create data collator
         data_collator = SFTDataCollatorWith4DAttentionMask(
@@ -265,7 +276,7 @@ def extract_olmoe_routing(
 
         # Run prediction to extract router logits
         logger.info("Extracting router logits...")
-        trainer.predict(eval_dataset)
+        trainer.predict(eval_dataset)  # type: ignore
 
         # Save results
         trainer.save_router_logits()
