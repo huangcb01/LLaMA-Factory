@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from transformers.training_args_seq2seq import Seq2SeqTrainingArguments
+from accelerate import Accelerator, DistributedDataParallelKwargs
 
 from llamafactory.data import get_dataset, get_template_and_fix_tokenizer
 from llamafactory.extras.constants import IGNORE_INDEX
@@ -45,10 +46,13 @@ def extract_olmoe_routing(
     default_system: Optional[str] = None,
 ):
     r"""
-    Extract routing outputs from OLMoE model on training data.
+    Extract routing outputs from OLMoE model on training data with multi-GPU support.
 
     This script loads an OLMoE model and performs forward passes on the specified dataset,
     capturing the router logits from each MoE layer. The routing information is saved to NPZ file.
+
+    Supports multi-GPU data parallel inference using Accelerate. Each GPU loads a copy of the model
+    and processes a portion of the dataset in parallel.
 
     Args:
         model_name_or_path: Path to the pretrained model or model identifier from huggingface.co/models
@@ -63,12 +67,23 @@ def extract_olmoe_routing(
         default_system: Default system message to use in the template
 
     Usage:
+        # Single GPU
         python extract_olmoe_routing.py \
             --model_name_or_path allenai/OLMoE-1B-7B-0924 \
             --dataset alpaca_en_demo \
             --template default \
             --output_dir routing_outputs
+
+        # Multi-GPU (4 GPUs)
+        accelerate launch --num_processes 4 extract_olmoe_routing.py \
+            --model_name_or_path allenai/OLMoE-1B-7B-0924 \
+            --dataset alpaca_en_demo \
+            --template default \
+            --output_dir routing_outputs
     """
+    # Initialize Accelerator for multi-GPU support
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     # Get dataset file name from dataset_info.json
     dataset_info_path = os.path.join(dataset_dir, "dataset_info.json")
     if not os.path.exists(dataset_info_path):
@@ -88,15 +103,19 @@ def extract_olmoe_routing(
     base_name = os.path.splitext(dataset_file_name)[0]
     save_name = os.path.join(output_dir, f"{base_name}.npz")
 
-    print("=" * 80)
-    print("OLMoE Routing Extraction Script")
-    print("=" * 80)
-    print(f"Model: {model_name_or_path}")
-    print(f"Dataset: {dataset}")
-    print(f"Dataset file: {dataset_file_name}")
-    print(f"Template: {template}")
-    print(f"Output file: {save_name}")
-    print("=" * 80)
+    # Only print on main process
+    if accelerator.is_main_process:
+        print("=" * 80)
+        print("OLMoE Routing Extraction Script (Multi-GPU)")
+        print("=" * 80)
+        print(f"Model: {model_name_or_path}")
+        print(f"Dataset: {dataset}")
+        print(f"Dataset file: {dataset_file_name}")
+        print(f"Template: {template}")
+        print(f"Output file: {save_name}")
+        print(f"Number of processes: {accelerator.num_processes}")
+        print(f"Current process: {accelerator.process_index}")
+        print("=" * 80)
 
     # Initialize arguments
     model_args, data_args, finetuning_args, generating_args = get_infer_args(
@@ -117,31 +136,38 @@ def extract_olmoe_routing(
     training_args = Seq2SeqTrainingArguments(output_dir="dummy_dir")
 
     # Load tokenizer and template
-    print("\n[1/4] Loading tokenizer and template...")
+    if accelerator.is_main_process:
+        print("\n[1/4] Loading tokenizer and template...")
     tokenizer_module = load_tokenizer(model_args)
     tokenizer = tokenizer_module["tokenizer"]
     template_obj = get_template_and_fix_tokenizer(tokenizer, data_args)
 
     # Load model
-    print("\n[2/4] Loading model...")
+    if accelerator.is_main_process:
+        print("\n[2/4] Loading model...")
     model = load_model(tokenizer, model_args, finetuning_args, is_trainable=False)
 
     # Check if model is OLMoE
     model_type = getattr(model.config, "model_type", None)
-    if model_type != "olmoe":
+    if model_type != "olmoe" and accelerator.is_main_process:
         print(f"Warning: Model type is '{model_type}', not 'olmoe'. This script is designed for OLMoE models.")
         print("Continuing anyway, but routing outputs may not be available.")
 
     model.eval()
-    device = next(model.parameters()).device
 
-    print(f"Model loaded on device: {device}")
-    print(f"Model config: num_hidden_layers={model.config.num_hidden_layers}, "
-          f"num_experts={getattr(model.config, 'num_experts', 'N/A')}, "
-          f"num_experts_per_tok={getattr(model.config, 'num_experts_per_tok', 'N/A')}")
+    # Prepare model with accelerator
+    model = accelerator.prepare(model)
+    device = accelerator.device
+
+    if accelerator.is_main_process:
+        print(f"Model loaded on device: {device}")
+        print(f"Model config: num_hidden_layers={model.config.num_hidden_layers}, "
+              f"num_experts={getattr(model.config, 'num_experts', 'N/A')}, "
+              f"num_experts_per_tok={getattr(model.config, 'num_experts_per_tok', 'N/A')}")
 
     # Load dataset
-    print("\n[3/4] Loading dataset...")
+    if accelerator.is_main_process:
+        print("\n[3/4] Loading dataset...")
     dataset_module = get_dataset(
         template_obj,
         model_args,
@@ -162,18 +188,46 @@ def extract_olmoe_routing(
         eval_dataset = cast("Dataset", eval_dataset)
 
     dataset_len = len(eval_dataset)  # type: ignore
-    print(f"Dataset loaded: {dataset_len} samples")
+    if accelerator.is_main_process:
+        print(f"Dataset loaded: {dataset_len} samples")
+
+    # Split dataset across processes
+    # Each process will handle a subset of the data
+    samples_per_process = (dataset_len + accelerator.num_processes - 1) // accelerator.num_processes
+    start_idx = accelerator.process_index * samples_per_process
+    end_idx = min(start_idx + samples_per_process, dataset_len)
+
+    if accelerator.is_main_process:
+        print(f"\nData distribution across {accelerator.num_processes} processes:")
+        for i in range(accelerator.num_processes):
+            proc_start = i * samples_per_process
+            proc_end = min(proc_start + samples_per_process, dataset_len)
+            print(f"  Process {i}: samples {proc_start} to {proc_end-1} ({proc_end - proc_start} samples)")
+
+    accelerator.print(f"Process {accelerator.process_index}: Processing samples {start_idx} to {end_idx-1}")
 
     # Process data and extract routing
-    print("\n[4/4] Processing data and extracting routing outputs...")
+    if accelerator.is_main_process:
+        print("\n[4/4] Processing data and extracting routing outputs...")
+
     all_samples_router_logits = []  # List to store router logits for each sample
+    all_sample_indices = []  # Store original sample indices
 
     with torch.no_grad():
-        for idx in tqdm(range(0, dataset_len, batch_size), desc="Extracting routing"):
+        # Only process this process's portion of the dataset
+        iterator = range(start_idx, end_idx, batch_size)
+        if accelerator.is_main_process:
+            iterator = tqdm(iterator, desc=f"Process {accelerator.process_index} extracting routing")
+        else:
+            iterator = tqdm(iterator, desc=f"Process {accelerator.process_index}", disable=not accelerator.is_local_main_process)
+
+        for idx in iterator:
             # Get batch samples
             batch_samples = []
-            for i in range(idx, min(idx + batch_size, dataset_len)):
+            batch_indices = []
+            for i in range(idx, min(idx + batch_size, end_idx)):
                 batch_samples.append(eval_dataset[i])  # type: ignore
+                batch_indices.append(i)
 
             # Prepare batch inputs
             input_ids_list = [sample["input_ids"] for sample in batch_samples]
@@ -191,52 +245,83 @@ def extract_olmoe_routing(
             )
 
             # Extract router logits for each sample
-            if hasattr(outputs, "router_logits") and outputs.router_logits is not None:
-                num_layers = len(outputs.router_logits)
+            num_layers = len(outputs.router_logits)
 
-                # Process each sample in the batch
-                for i in range(len(batch_samples)):
-                    sample_router_logits = []
+            # Process each sample in the batch
+            for i in range(len(batch_samples)):
+                sample_router_logits = []
 
-                    # Collect all layers' router logits for this sample
-                    for layer_idx in range(num_layers):
-                        # router_logits shape: [batch_size, seq_len, num_experts]
-                        layer_routing = outputs.router_logits[layer_idx][i].cpu().numpy()
-                        sample_router_logits.append(layer_routing)
+                # Get attention mask for this sample to identify non-padding tokens
+                sample_attention_mask = attention_mask[i].cpu().numpy()  # shape: [seq_len]
+                valid_positions = sample_attention_mask == 1  # True for non-padding positions
 
-                    # Stack layers into a single array: [num_layers, seq_len, num_experts]
-                    all_samples_router_logits.append(np.stack(sample_router_logits, axis=0))
+                # Collect all layers' router logits for this sample
+                for layer_idx in range(num_layers):
+                    # router_logits shape: [batch_size, seq_len, num_experts]
+                    layer_routing = outputs.router_logits[layer_idx][i].cpu().numpy()
 
-    # Save results
-    print(f"\n[5/5] Saving results to {save_name}...")
-    save_dir = os.path.dirname(save_name)
-    if save_dir and not os.path.exists(save_dir):
-        os.makedirs(save_dir, exist_ok=True)
+                    # Only keep router logits for non-padding positions
+                    layer_routing_valid = layer_routing[valid_positions]  # shape: [valid_seq_len, num_experts]
+                    sample_router_logits.append(layer_routing_valid)
 
-    # Prepare data for NPZ format - store by sample
-    save_dict = {}
-    for sample_idx, sample_logits in enumerate(all_samples_router_logits):
-        # Each sample's data shape: [num_layers, seq_len, num_experts]
-        save_dict[f"sample_{sample_idx}"] = sample_logits
+                # Stack layers into a single array: [num_layers, valid_seq_len, num_experts]
+                all_samples_router_logits.append(np.stack(sample_router_logits, axis=0))
+                all_sample_indices.append(batch_indices[i])
 
-    # Save as compressed NPZ
-    np.savez_compressed(save_name, **save_dict)
+    # Wait for all processes to finish
+    accelerator.wait_for_everyone()
 
-    print("=" * 80)
-    print(f"✓ Successfully extracted routing outputs for {len(all_samples_router_logits)} samples")
-    print(f"✓ Results saved to: {save_name}")
-    print("=" * 80)
+    # Gather results from all processes
+    if accelerator.is_main_process:
+        print(f"\n[5/6] Gathering results from all processes...")
 
-    # Print sample statistics
-    if all_samples_router_logits:
-        print("\nSample statistics:")
-        first_sample = all_samples_router_logits[0]
-        print(f"  - Total samples: {len(all_samples_router_logits)}")
-        print(f"  - Shape per sample: {first_sample.shape} (num_layers, seq_len, num_experts)")
-        print(f"  - Data type: {first_sample.dtype}")
-        print(f"\nTo load a specific sample:")
-        print(f"  data = np.load('{save_name}')")
-        print(f"  sample_0 = data['sample_0']  # Shape: {first_sample.shape}")
+    # Save local results first
+    local_save_dict = {}
+    for idx, sample_logits in zip(all_sample_indices, all_samples_router_logits):
+        local_save_dict[f"sample_{idx}"] = sample_logits
+
+    # Use object_list to gather dictionaries from all processes
+    if accelerator.num_processes > 1:
+        import torch.distributed as dist
+        gathered_dicts = [None] * accelerator.num_processes
+        dist.all_gather_object(gathered_dicts, local_save_dict)
+    else:
+        gathered_dicts = [local_save_dict]
+
+    # Only main process saves the results
+    if accelerator.is_main_process:
+        print(f"\n[6/6] Saving results to {save_name}...")
+        save_dir = os.path.dirname(save_name)
+        if save_dir and not os.path.exists(save_dir):
+            os.makedirs(save_dir, exist_ok=True)
+
+        # Prepare data for NPZ format - merge all dictionaries from all processes
+        save_dict = {}
+        for proc_dict in gathered_dicts:
+            if proc_dict is not None:
+                save_dict.update(proc_dict)
+
+        # Save as compressed NPZ
+        np.savez_compressed(save_name, **save_dict)
+
+        print("=" * 80)
+        print(f"✓ Successfully extracted routing outputs for {len(save_dict)} samples")
+        print(f"✓ Results saved to: {save_name}")
+        print("=" * 80)
+
+        # Print sample statistics
+        if save_dict:
+            print("\nSample statistics:")
+            first_sample = list(save_dict.values())[0]
+            print(f"  - Total samples: {len(save_dict)}")
+            print(f"  - Shape per sample: {first_sample.shape} (num_layers, seq_len, num_experts)")
+            print(f"  - Data type: {first_sample.dtype}")
+            print(f"\nTo load a specific sample:")
+            print(f"  data = np.load('{save_name}')")
+            print(f"  sample_0 = data['sample_0']  # Shape: {first_sample.shape}")
+
+    # Wait for main process to finish saving
+    accelerator.wait_for_everyone()
 
 
 if __name__ == "__main__":
