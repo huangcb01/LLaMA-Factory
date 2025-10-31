@@ -34,10 +34,9 @@ logger = get_logger(__name__)
 class RouterExtractionTrainer(Seq2SeqTrainer):
     """Custom trainer for extracting router logits from MoE models."""
 
-    def __init__(self, output_dir: str, dataset_name: str, **kwargs):
+    def __init__(self, output_dir: str, **kwargs):
         super().__init__(**kwargs)
         self.output_dir_routing = output_dir
-        self.dataset_name = dataset_name
         self.all_router_logits = []
 
     @override
@@ -82,13 +81,13 @@ class RouterExtractionTrainer(Seq2SeqTrainer):
         # Return dummy values (we don't care about loss/predictions)
         return (None, None, None)
 
-    def save_router_logits(self):
+    def save_router_logits(self, dataset_name: str):
         """Save collected router logits to file, restoring original order."""
         if not self.is_world_process_zero():
             return
 
         os.makedirs(self.output_dir_routing, exist_ok=True)
-        save_path = os.path.join(self.output_dir_routing, f"{self.dataset_name}.npz")
+        save_path = os.path.join(self.output_dir_routing, f"{dataset_name}.npz")
         logger.info(f"Saving router logits to {save_path}")
 
         # Prepare save dict with original order
@@ -103,6 +102,7 @@ class RouterExtractionTrainer(Seq2SeqTrainer):
         if save_dict:
             first_sample = list(save_dict.values())[0]
             logger.info(f"  Shape per sample: {first_sample.shape} (num_layers, valid_seq_len, num_experts)")
+        self.all_router_logits = []  # Clear after saving
 
 
 def extract_olmoe_routing(
@@ -184,6 +184,38 @@ def extract_olmoe_routing(
     if model_type != "olmoe":
         logger.warning(f"Model type is '{model_type}', not 'olmoe'. " "This script is designed for OLMoE models.")
 
+    # Create minimal training args for prediction
+    training_args = Seq2SeqTrainingArguments(
+        output_dir=output_dir,
+        per_device_eval_batch_size=batch_size,
+        dataloader_num_workers=0,
+        remove_unused_columns=False,
+        do_train=False,
+        do_eval=False,
+        do_predict=True,
+        prediction_loss_only=False,
+        disable_tqdm=False,
+    )
+    # Create data collator
+    data_collator = SFTDataCollatorWith4DAttentionMask(
+        template=template_obj,
+        model=None,
+        pad_to_multiple_of=None,
+        label_pad_token_id=IGNORE_INDEX,
+        block_diag_attn=model_args.block_diag_attn,
+        attn_implementation=getattr(model.config, "_attn_implementation", None),
+        compute_dtype=model_args.compute_dtype,
+        **tokenizer_module,
+    )
+    # Create custom trainer
+    trainer = RouterExtractionTrainer(
+        model=model,
+        args=training_args,
+        data_collator=data_collator,
+        output_dir=output_dir,
+        tokenizer=tokenizer,
+    )
+
     # Process each dataset
     for dataset_idx, current_dataset in enumerate(dataset_names):
         logger.info("=" * 80)
@@ -203,19 +235,6 @@ def extract_olmoe_routing(
                 preprocessing_num_workers=16,
                 default_system=default_system,
             )
-        )
-
-        # Create minimal training args for prediction
-        training_args = Seq2SeqTrainingArguments(
-            output_dir=output_dir,
-            per_device_eval_batch_size=batch_size,
-            dataloader_num_workers=0,
-            remove_unused_columns=False,
-            do_train=False,
-            do_eval=False,
-            do_predict=True,
-            prediction_loss_only=False,
-            disable_tqdm=False,
         )
 
         # Load dataset
@@ -251,35 +270,12 @@ def extract_olmoe_routing(
         logger.info(f"  Shortest sequence: {lengths[-1]} tokens")
         logger.info(f"  Average length: {sum(lengths) / len(lengths):.1f} tokens")
 
-        # Create data collator
-        data_collator = SFTDataCollatorWith4DAttentionMask(
-            template=template_obj,
-            model=None,
-            pad_to_multiple_of=None,
-            label_pad_token_id=IGNORE_INDEX,
-            block_diag_attn=model_args.block_diag_attn,
-            attn_implementation=getattr(model.config, "_attn_implementation", None),
-            compute_dtype=model_args.compute_dtype,
-            **tokenizer_module,
-        )
-
-        # Create custom trainer
-        trainer = RouterExtractionTrainer(
-            model=model,
-            args=training_args,
-            data_collator=data_collator,
-            eval_dataset=eval_dataset,
-            output_dir=output_dir,
-            dataset_name=current_dataset,
-            tokenizer=tokenizer,
-        )
-
         # Run prediction to extract router logits
         logger.info("Extracting router logits...")
         trainer.predict(eval_dataset)  # type: ignore
 
         # Save results
-        trainer.save_router_logits()
+        trainer.save_router_logits(current_dataset)
 
     logger.info("=" * 80)
     logger.info(f"✓ All {len(dataset_names)} datasets processed successfully!")
