@@ -62,15 +62,18 @@ class RouterExtractionTrainer(Seq2SeqTrainer):
 
             # Extract and store router logits
             batch_size = inputs["input_ids"].size(0)
+            seq_len = inputs["input_ids"].size(1)
+            num_layers = len(outputs.router_logits)
+            num_experts = outputs.router_logits[0].size(-1)
 
-            # Stack all layers: tuple of [batch, seq_len, num_experts] -> [num_layers, batch, seq_len, num_experts]
-            router_logits = torch.stack(outputs.router_logits, dim=0).cpu().numpy()
-            attention_mask = inputs["attention_mask"].cpu().numpy().astype(bool)
+            # Stack all layers: tuple of [batch*seq_len, num_experts] -> [num_layers, batch, seq_len, num_experts]
+            router_logits = torch.stack(outputs.router_logits, dim=0).view(num_layers, batch_size, seq_len, num_experts)
+            attention_mask = inputs["attention_mask"].to(torch.bool)
 
             # Process each sample in the batch
             for i in range(batch_size):
                 # Filter by attention mask: [num_layers, seq_len, num_experts] -> [num_layers, valid_seq_len, num_experts]
-                sample_router_logits = router_logits[:, i, attention_mask[i], :]
+                sample_router_logits = router_logits[:, i, attention_mask[i], :].float().cpu().numpy()
                 self.all_router_logits.append(sample_router_logits)
 
         # Return dummy values (we don't care about loss/predictions)
@@ -257,7 +260,7 @@ def extract_olmoe_routing(
             eval_dataset=eval_dataset,
             output_dir=output_dir,
             dataset_name=current_dataset,
-            **tokenizer_module,
+            tokenizer=tokenizer,
         )
 
         # Run prediction to extract router logits
