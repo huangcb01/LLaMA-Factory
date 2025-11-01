@@ -184,11 +184,11 @@ def main(
     )
 
     # Load tokenizer and model (once for all datasets)
-    logger.info("Loading tokenizer and template...")
+    logger.info_rank0("Loading tokenizer and template...")
     tokenizer_module = load_tokenizer(model_args)
     tokenizer = tokenizer_module["tokenizer"]
     template_obj = get_template_and_fix_tokenizer(tokenizer, data_args)
-    logger.info("Loading model...")
+    logger.info_rank0("Loading model...")
     model = load_model(tokenizer, model_args, finetuning_args, is_trainable=False)
 
     # Check model type
@@ -224,26 +224,27 @@ def main(
 
     # Process each dataset
     for dataset_name, eval_dataset in eval_datasets.items():
-        logger.info("=" * 80)
-        logger.info(f"Processing dataset {dataset_name} with {len(eval_dataset)} samples...")
-        logger.info("=" * 80)
+        logger.info_rank0("=" * 80)
+        logger.info_rank0(f"Processing dataset {dataset_name} with {len(eval_dataset)} samples...")
+        logger.info_rank0("=" * 80)
 
         # Sort dataset by sequence length (longest first) to minimize padding
-        logger.info("Sorting dataset by sequence length to minimize padding...")
-        eval_dataset = eval_dataset.map(
-            lambda x, idx: {"length": len(x["input_ids"]), "original_index": idx},
-            with_indices=True,
-            num_proc=os.cpu_count(),
-        )
-        eval_dataset = eval_dataset.sort("length", reverse=True)
-        lengths = eval_dataset["length"]
-        eval_dataset = eval_dataset.remove_columns("length")
-        logger.info(f"  Longest sequence: {lengths[0]} tokens")
-        logger.info(f"  Shortest sequence: {lengths[-1]} tokens")
-        logger.info(f"  Average length: {sum(lengths) / len(lengths):.1f} tokens")
+        with training_args.main_process_first(desc="load dataset", local=(not data_args.data_shared_file_system)):
+            logger.info_rank0("Sorting dataset by sequence length to minimize padding...")
+            eval_dataset = eval_dataset.map(
+                lambda x, idx: {"length": len(x["input_ids"]), "original_index": idx},
+                with_indices=True,
+                num_proc=os.cpu_count(),
+            )
+            eval_dataset = eval_dataset.sort("length", reverse=True)
+            lengths = eval_dataset["length"]
+            eval_dataset = eval_dataset.remove_columns("length")
+            logger.info_rank0(f"  Longest sequence: {lengths[0]} tokens")
+            logger.info_rank0(f"  Shortest sequence: {lengths[-1]} tokens")
+            logger.info_rank0(f"  Average length: {sum(lengths) / len(lengths):.1f} tokens")
 
         # Run prediction to extract router logits
-        logger.info("Extracting router logits...")
+        logger.info_rank0("Extracting router logits...")
         trainer.predict(eval_dataset)  # type: ignore
 
         # Save results
