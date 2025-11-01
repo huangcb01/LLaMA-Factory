@@ -145,37 +145,37 @@ def extract_olmoe_routing(
             --dataset alpaca_en_demo,alpaca_zh_demo \\
             --batch_size 4
     """
-    # Parse dataset names
-    dataset_names = [name.strip() for name in dataset.split(",")]
-
-    logger.info("=" * 80)
-    logger.info("OLMoE Routing Extraction Script")
-    logger.info("=" * 80)
-    logger.info(f"Model: {model_name_or_path}")
-    logger.info(f"Datasets: {', '.join(dataset_names)} ({len(dataset_names)} total)")
-    logger.info(f"Output directory: {output_dir}")
-    logger.info("=" * 80)
-
-    # Load tokenizer and model (once for all datasets)
-    logger.info("Loading tokenizer and template...")
-    model_args, data_args, finetuning_args, generating_args = get_infer_args(
+    model_args, data_args, finetuning_args, _ = get_infer_args(
         dict(
             model_name_or_path=model_name_or_path,
             adapter_name_or_path=adapter_name_or_path,
-            dataset=dataset_names[0],
+            eval_dataset=dataset,
+            eval_on_each_dataset=True,
             dataset_dir=dataset_dir,
             template=template,
             cutoff_len=cutoff_len,
             max_samples=max_samples,
-            preprocessing_num_workers=16,
+            preprocessing_num_workers=os.cpu_count(),
             default_system=default_system,
         )
     )
+    training_args = Seq2SeqTrainingArguments(
+        output_dir=output_dir,
+        per_device_eval_batch_size=batch_size,
+        dataloader_num_workers=1,
+        remove_unused_columns=False,
+        do_train=False,
+        do_eval=False,
+        do_predict=True,
+        prediction_loss_only=False,
+        disable_tqdm=False,
+    )
 
+    # Load tokenizer and model (once for all datasets)
+    logger.info("Loading tokenizer and template...")
     tokenizer_module = load_tokenizer(model_args)
     tokenizer = tokenizer_module["tokenizer"]
     template_obj = get_template_and_fix_tokenizer(tokenizer, data_args)
-
     logger.info("Loading model...")
     model = load_model(tokenizer, model_args, finetuning_args, is_trainable=False)
 
@@ -184,18 +184,11 @@ def extract_olmoe_routing(
     if model_type != "olmoe":
         logger.warning(f"Model type is '{model_type}', not 'olmoe'. " "This script is designed for OLMoE models.")
 
-    # Create minimal training args for prediction
-    training_args = Seq2SeqTrainingArguments(
-        output_dir=output_dir,
-        per_device_eval_batch_size=batch_size,
-        dataloader_num_workers=0,
-        remove_unused_columns=False,
-        do_train=False,
-        do_eval=False,
-        do_predict=True,
-        prediction_loss_only=False,
-        disable_tqdm=False,
-    )
+    # Load datasets
+    dataset_module = get_dataset(template_obj, model_args, data_args, training_args, stage="sft", **tokenizer_module)
+    eval_datasets = dataset_module.get("eval_dataset")
+    assert isinstance(eval_datasets, dict), "eval_dataset should be a dict of datasets for multiple datasets."
+
     # Create data collator
     data_collator = SFTDataCollatorWith4DAttentionMask(
         template=template_obj,
@@ -207,6 +200,7 @@ def extract_olmoe_routing(
         compute_dtype=model_args.compute_dtype,
         **tokenizer_module,
     )
+
     # Create custom trainer
     trainer = RouterExtractionTrainer(
         model=model,
@@ -217,44 +211,10 @@ def extract_olmoe_routing(
     )
 
     # Process each dataset
-    for dataset_idx, current_dataset in enumerate(dataset_names):
+    for dataset_name, eval_dataset in eval_datasets.items():
         logger.info("=" * 80)
-        logger.info(f"Processing dataset {dataset_idx + 1}/{len(dataset_names)}: {current_dataset}")
+        logger.info(f"Processing dataset {dataset_name} with {len(eval_dataset)} samples...")
         logger.info("=" * 80)
-
-        # Update data_args for current dataset
-        _, data_args, _, _ = get_infer_args(
-            dict(
-                model_name_or_path=model_name_or_path,
-                adapter_name_or_path=adapter_name_or_path,
-                eval_dataset=current_dataset,
-                dataset_dir=dataset_dir,
-                template=template,
-                cutoff_len=cutoff_len,
-                max_samples=max_samples,
-                preprocessing_num_workers=16,
-                default_system=default_system,
-            )
-        )
-
-        # Load dataset
-        logger.info(f"Loading dataset: {current_dataset}...")
-        dataset_module = get_dataset(
-            template_obj,
-            model_args,
-            data_args,
-            training_args,
-            stage="sft",
-            **tokenizer_module,
-        )
-
-        eval_dataset = dataset_module.get("eval_dataset")
-        if not isinstance(eval_dataset, datasets.Dataset):
-            logger.error(f"No dataset available for '{current_dataset}'")
-            continue
-
-        dataset_len = len(eval_dataset)
-        logger.info(f"Dataset loaded: {dataset_len} samples")
 
         # Sort dataset by sequence length (longest first) to minimize padding
         logger.info("Sorting dataset by sequence length to minimize padding...")
@@ -275,11 +235,7 @@ def extract_olmoe_routing(
         trainer.predict(eval_dataset)  # type: ignore
 
         # Save results
-        trainer.save_router_logits(current_dataset)
-
-    logger.info("=" * 80)
-    logger.info(f"✓ All {len(dataset_names)} datasets processed successfully!")
-    logger.info("=" * 80)
+        trainer.save_router_logits(dataset_name)
 
 
 if __name__ == "__main__":
