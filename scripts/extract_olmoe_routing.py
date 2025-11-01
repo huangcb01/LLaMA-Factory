@@ -29,7 +29,9 @@ from llamafactory.hparams import get_infer_args
 from llamafactory.model import load_model, load_tokenizer
 
 
-logger = get_logger(__name__)
+# Use a logger under the `llamafactory` namespace so it shares the configured handlers
+# from `llamafactory.extras.logging` and actually prints to stdout.
+logger = get_logger("llamafactory.scripts.extract_olmoe_routing")
 
 
 class RouterExtractionTrainer(Seq2SeqTrainer):
