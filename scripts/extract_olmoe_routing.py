@@ -17,6 +17,7 @@ import datasets
 import fire
 import numpy as np
 import torch
+import torch.distributed as dist
 from typing import Any, Optional
 from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 from typing_extensions import override
@@ -37,7 +38,7 @@ class RouterExtractionTrainer(Seq2SeqTrainer):
     def __init__(self, output_dir: str, **kwargs):
         super().__init__(**kwargs)
         self.output_dir_routing = output_dir
-        self.all_router_logits = []
+        self.all_router_logits: dict[str, np.ndarray] = {}
 
     @override
     def prediction_step(
@@ -75,37 +76,59 @@ class RouterExtractionTrainer(Seq2SeqTrainer):
                 # Filter by attention mask: [num_layers, seq_len, num_experts] -> [num_layers, valid_seq_len, num_experts]
                 sample_router_logits = router_logits[:, i, attention_mask[i], :].float().cpu().numpy()
 
-                # Store with original index for later reordering
-                self.all_router_logits.append((original_indices[i], sample_router_logits))
+                # Store with original index as key (already in final dict format)
+                self.all_router_logits[f"sample_{original_indices[i].item()}"] = sample_router_logits
 
         # Return dummy values (we don't care about loss/predictions)
         return (None, None, None)
 
     def save_router_logits(self, dataset_name: str):
-        """Save collected router logits to file, restoring original order."""
-        if not self.is_world_process_zero():
-            return
+        """Save collected router logits in a DDP-safe way.
 
+        - Each rank writes its own shard: {dataset}.rank{r}.npz
+        - Rank 0 waits for all ranks, merges shards into {dataset}.npz, and cleans up.
+        """
+        dist_available = dist.is_available() and dist.is_initialized()
+        rank = dist.get_rank() if dist_available else 0
+        world_size = dist.get_world_size() if dist_available else 1
+
+        # Save shard for this rank
         os.makedirs(self.output_dir_routing, exist_ok=True)
-        save_path = os.path.join(self.output_dir_routing, f"{dataset_name}.npz")
-        logger.info(f"Saving router logits to {save_path}")
+        shard_path = os.path.join(self.output_dir_routing, f"{dataset_name}.rank{rank}.npz")
+        logger.info(f"Saving router logits shard (rank {rank}/{world_size}) to {shard_path}")
+        np.savez_compressed(shard_path, **self.all_router_logits)
+        logger.info(f"✓ Rank {rank}: saved {len(self.all_router_logits)} samples")
+        self.all_router_logits = {}  # Free memory after writing this shard
 
-        # Prepare save dict with original order
-        save_dict = {}
-        for original_idx, sample_logits in self.all_router_logits:
-            save_dict[f"sample_{original_idx}"] = sample_logits
+        # Sync all ranks before merging
+        if dist_available:
+            dist.barrier()
 
-        # Save as compressed NPZ
-        np.savez_compressed(save_path, **save_dict)
+        # Merge shards on rank 0
+        if (not dist_available) or rank == 0:
+            merged = {}
+            shard_paths = []
+            for r in range(world_size):
+                p = os.path.join(self.output_dir_routing, f"{dataset_name}.rank{r}.npz")
+                data = np.load(p, allow_pickle=False)
+                for k in data.files:
+                    merged[k] = data[k]
+                shard_paths.append(p)
 
-        logger.info(f"✓ Successfully saved {len(save_dict)} samples in original order")
-        if save_dict:
-            first_sample = list(save_dict.values())[0]
-            logger.info(f"  Shape per sample: {first_sample.shape} (num_layers, valid_seq_len, num_experts)")
-        self.all_router_logits = []  # Clear after saving
+            final_path = os.path.join(self.output_dir_routing, f"{dataset_name}.npz")
+            logger.info(f"Merging {len(shard_paths)} shard(s) -> {final_path}")
+            np.savez_compressed(final_path, **merged)
+            logger.info(f"✓ Successfully saved {len(merged)} samples in original order to {final_path}")
+
+            # Cleanup shard files
+            for p in shard_paths:
+                try:
+                    os.remove(p)
+                except Exception as e:
+                    logger.warning(f"Failed to remove shard file {p}: {e}")
 
 
-def extract_olmoe_routing(
+def main(
     model_name_or_path: str,
     adapter_name_or_path: Optional[str] = None,
     dataset: str = "alpaca_en_demo",
@@ -131,19 +154,6 @@ def extract_olmoe_routing(
         output_dir: Output directory for routing results
         batch_size: Batch size for processing
         default_system: Default system message
-
-    Usage:
-        # Single GPU
-        python extract_olmoe_routing_v2.py \\
-            --model_name_or_path allenai/OLMoE-1B-7B-0924 \\
-            --dataset alpaca_en_demo \\
-            --batch_size 4
-
-        # Multi-GPU (automatic with Trainer)
-        CUDA_VISIBLE_DEVICES=0,1,2,3 python extract_olmoe_routing_v2.py \\
-            --model_name_or_path allenai/OLMoE-1B-7B-0924 \\
-            --dataset alpaca_en_demo,alpaca_zh_demo \\
-            --batch_size 4
     """
     model_args, data_args, finetuning_args, _ = get_infer_args(
         dict(
@@ -239,4 +249,4 @@ def extract_olmoe_routing(
 
 
 if __name__ == "__main__":
-    fire.Fire(extract_olmoe_routing)
+    fire.Fire(main)
