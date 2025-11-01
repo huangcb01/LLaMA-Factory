@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import gc
 import datasets
 import fire
 import numpy as np
@@ -101,6 +102,7 @@ class RouterExtractionTrainer(Seq2SeqTrainer):
         np.savez_compressed(shard_path, **self.all_router_logits)
         logger.info(f"✓ Rank {rank}: saved {len(self.all_router_logits)} samples")
         self.all_router_logits = {}  # Free memory after writing this shard
+        gc.collect()  # Proactively trigger GC to free tensor/array memory
 
         # Sync all ranks before merging
         if dist_available:
@@ -112,15 +114,19 @@ class RouterExtractionTrainer(Seq2SeqTrainer):
             shard_paths = []
             for r in range(world_size):
                 p = os.path.join(self.output_dir_routing, f"{dataset_name}.rank{r}.npz")
-                data = np.load(p, allow_pickle=False)
-                for k in data.files:
-                    merged[k] = data[k]
+                # Ensure the NPZ file is closed immediately after reading to release file/memory resources
+                with np.load(p, allow_pickle=False) as data:
+                    for k in data.files:
+                        merged[k] = data[k]
                 shard_paths.append(p)
 
             final_path = os.path.join(self.output_dir_routing, f"{dataset_name}.npz")
             logger.info(f"Merging {len(shard_paths)} shard(s) -> {final_path}")
             np.savez_compressed(final_path, **merged)
             logger.info(f"✓ Successfully saved {len(merged)} samples in original order to {final_path}")
+            # Help the GC by dropping large temporary maps
+            merged.clear()
+            gc.collect()
 
             # Cleanup shard files
             for p in shard_paths:
