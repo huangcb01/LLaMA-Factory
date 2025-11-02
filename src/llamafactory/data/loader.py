@@ -242,36 +242,36 @@ def _get_dataset_processor(
     return dataset_processor_class(template=template, tokenizer=tokenizer, processor=processor, data_args=data_args)
 
 
-def _add_gold_router_logits(
+def _add_gold_router_indices(
     dataset: Union["Dataset", "IterableDataset"],
     dataset_name: str,
 ) -> Union["Dataset", "IterableDataset"]:
-    r"""Add gold router logits to dataset if available."""
+    r"""Add gold router activated expert indices to dataset if available."""
     from .gold_router_loader import get_gold_router_loader
 
     loader = get_gold_router_loader()
-    if loader is None or not loader.has_gold_logits(dataset_name):
+    if loader is None or not loader.has_gold_indices(dataset_name):
         return dataset
 
-    def add_logits(examples, indices):
-        # For each sample in the batch, load its gold router logits
-        gold_logits_list = []
+    def add_indices(examples, indices):
+        # For each sample in the batch, load its gold router indices
+        gold_indices_list = []
         for idx in indices:
-            logits = loader.get_sample_logits(dataset_name, idx)
-            gold_logits_list.append(logits.numpy())  # Store as numpy for dataset
+            inds = loader.get_sample_indices(dataset_name, idx)
+            gold_indices_list.append(inds.numpy())  # Store as numpy for dataset
 
-        examples["gold_router_logits"] = gold_logits_list
+        examples["gold_router_indices"] = gold_indices_list
         return examples
 
     # Add gold logits as a new column
     dataset = dataset.map(
-        add_logits,
+        add_indices,
         batched=True,
         with_indices=True,
-        desc=f"Adding gold router logits for {dataset_name}",
+        desc=f"Adding gold router indices for {dataset_name}",
     )
 
-    logger.info_rank0(f"Added gold router logits to dataset '{dataset_name}'.")
+    logger.info_rank0(f"Added gold router indices to dataset '{dataset_name}'.")
     return dataset
 
 
@@ -310,9 +310,9 @@ def _get_preprocessed_dataset(
         **kwargs,
     )
 
-    # Add gold router logits if available
+    # Add gold router indices if available
     if dataset_name is not None and not data_args.streaming:
-        dataset = _add_gold_router_logits(dataset, dataset_name)
+        dataset = _add_gold_router_indices(dataset, dataset_name)
 
     if training_args.should_log:
         try:
@@ -337,10 +337,10 @@ def get_dataset(
     processor: Optional["ProcessorMixin"] = None,
 ) -> "DatasetModule":
     r"""Get the train dataset and optionally gets the evaluation dataset."""
-    # Initialize gold router logits loader if directory is provided
+    # Initialize gold router indices loader if directory is provided
     if data_args.gold_router_logits_dir:
         initialize_gold_router_loader(data_args)
-        logger.info_rank0(f"Initialized gold router logits loader with directory: {data_args.gold_router_logits_dir}")
+        logger.info_rank0(f"Initialized gold router indices loader with directory: {data_args.gold_router_logits_dir}")
 
     # Load tokenized dataset if path exists
     if data_args.tokenized_path is not None:

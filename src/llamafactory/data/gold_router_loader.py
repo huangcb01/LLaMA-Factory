@@ -14,7 +14,7 @@
 
 import json
 import os
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Optional, Union, cast
 
 import numpy as np
 import torch
@@ -29,19 +29,23 @@ if TYPE_CHECKING:
 logger = logging.get_logger(__name__)
 
 
-class GoldRouterLogitsLoader:
-    r"""Loader for gold router logits used in MoE auxiliary loss."""
+class GoldRouterIndicesLoader:
+    r"""Loader for gold router activated expert indices used in MoE auxiliary loss.
+
+    Note: The stored files are .npz with per-sample arrays shaped as
+    [num_layers, valid_seq_len, top_k] containing integer expert indices.
+    """
 
     def __init__(self, data_args: "DataArguments"):
         self.data_args = data_args
-        self.logits_cache = {}  # Cache loaded logits files
-        self.dataset_to_file = {}  # Map dataset name to logits file
+        self.logits_cache = {}  # Cache loaded indices files (npz)
+        self.dataset_to_file = {}  # Map dataset name to indices file
 
         if data_args.gold_router_logits_dir is not None:
             self._initialize_mappings()
 
     def _initialize_mappings(self):
-        """Initialize mappings between datasets and gold router logits files."""
+        """Initialize mappings between datasets and gold router indices files."""
         datasets = self.data_args.dataset if self.data_args.dataset is not None else []
 
         if len(datasets) == 0:
@@ -76,41 +80,48 @@ class GoldRouterLogitsLoader:
             logits_file = f"{base_name}.npz"
 
             # Check if the file exists in the gold_router_logits_dir
-            logits_path = os.path.join(self.data_args.gold_router_logits_dir, logits_file)
+            dir_path = cast(str, self.data_args.gold_router_logits_dir)
+            logits_path = os.path.join(dir_path, logits_file)
             if os.path.exists(logits_path):
                 self.dataset_to_file[dataset_name] = logits_file
-                logger.info_rank0(f"Found gold router logits for dataset '{dataset_name}': {logits_file}")
+                logger.info_rank0(f"Found gold router indices for dataset '{dataset_name}': {logits_file}")
             else:
-                logger.warning_rank0(f"Gold router logits file not found for dataset '{dataset_name}': {logits_path}")
+                logger.warning_rank0(f"Gold router indices file not found for dataset '{dataset_name}': {logits_path}")
 
-        logger.info_rank0(f"Gold router logits mappings: {self.dataset_to_file}")
+        logger.info_rank0(f"Gold router indices mappings: {self.dataset_to_file}")
 
-    def load_logits_file(self, logits_path: str):
-        """Load a gold router logits file. Returns NpzFile object or None."""
+    def load_indices_file(self, logits_path: str):
+        """Load a gold router indices file. Returns NpzFile object or None."""
         if logits_path in self.logits_cache:
             return self.logits_cache[logits_path]
-
-        full_path = os.path.join(self.data_args.gold_router_logits_dir, logits_path)
+        dir_path = cast(str, self.data_args.gold_router_logits_dir)
+        full_path = os.path.join(dir_path, logits_path)
         if not os.path.exists(full_path):
-            logger.warning_rank0(f"Gold router logits file not found: {full_path}")
+            logger.warning_rank0(f"Gold router indices file not found: {full_path}")
             return None
 
         try:
             logits_data = np.load(full_path)
             self.logits_cache[logits_path] = logits_data
-            logger.info_rank0(f"Loaded gold router logits from {full_path}, contains {len(logits_data.files)} samples")
+            logger.info_rank0(f"Loaded gold router indices from {full_path}, contains {len(logits_data.files)} samples")
             return logits_data
         except Exception as e:
-            logger.warning_rank0(f"Failed to load gold router logits from {full_path}: {e}")
+            logger.warning_rank0(f"Failed to load gold router indices from {full_path}: {e}")
             return None
 
-    def get_sample_logits(self, dataset_name: str, sample_idx: int) -> Optional[torch.Tensor]:
-        """Get gold router logits for a specific sample."""
+    def get_sample_indices(self, dataset_name: str, sample_idx: int) -> Optional[torch.Tensor]:
+        """Get gold router activated expert indices for a specific sample.
+
+        Returns
+        -------
+        Optional[torch.Tensor]
+            Tensor of shape [num_layers, seq_len, top_k] with dtype torch.int64
+        """
         if dataset_name not in self.dataset_to_file:
             return None
 
         logits_path = self.dataset_to_file[dataset_name]
-        logits_data = self.load_logits_file(logits_path)
+        logits_data = self.load_indices_file(logits_path)
 
         if logits_data is None:
             return None
@@ -119,28 +130,29 @@ class GoldRouterLogitsLoader:
         if sample_key not in logits_data:
             return None
 
-        # Convert to torch tensor: [num_layers, seq_len, num_experts]
-        return torch.from_numpy(logits_data[sample_key])
+        # Convert to torch tensor: [num_layers, seq_len, top_k] (indices)
+        arr = logits_data[sample_key]
+        return torch.from_numpy(arr).to(torch.long)
 
-    def has_gold_logits(self, dataset_name: str) -> bool:
-        """Check if gold router logits are available for a dataset."""
+    def has_gold_indices(self, dataset_name: str) -> bool:
+        """Check if gold router indices are available for a dataset."""
         return dataset_name in self.dataset_to_file
 
 
 # Global instance
-_global_loader: Optional[GoldRouterLogitsLoader] = None
+_global_loader: Optional[GoldRouterIndicesLoader] = None
 
 
 def initialize_gold_router_loader(data_args: "DataArguments"):
-    """Initialize the global gold router logits loader.
+    """Initialize the global gold router indices loader.
 
     Args:
         data_args: DataArguments object containing dataset and gold_router_logits_dir configuration.
     """
     global _global_loader
-    _global_loader = GoldRouterLogitsLoader(data_args)
+    _global_loader = GoldRouterIndicesLoader(data_args)
 
 
-def get_gold_router_loader() -> Optional[GoldRouterLogitsLoader]:
-    """Get the global gold router logits loader."""
+def get_gold_router_loader() -> Optional[GoldRouterIndicesLoader]:
+    """Get the global gold router indices loader."""
     return _global_loader

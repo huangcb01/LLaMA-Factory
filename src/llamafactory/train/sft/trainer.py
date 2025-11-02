@@ -120,25 +120,25 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             inputs["output_router_logits"] = True
             outputs = model(**inputs)
             loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
-            gold_logits = inputs.pop("gold_router_logits")
-            aux_loss = self._compute_gold_router_aux_loss(
+            gold_indices = inputs.pop("gold_router_indices")
+            aux_loss = self._compute_gold_router_aux_loss_from_indices(
                 outputs.router_logits,
-                gold_logits,
-                inputs.get("attention_mask", None)
+                gold_indices,
+                inputs.get("attention_mask", None),
             )
             loss = loss + self.finetuning_args.moe_router_loss_weight * aux_loss
             return loss
         else:
             return super().compute_loss(model, inputs, *args, **kwargs)
 
-    def _compute_gold_router_aux_loss(
+    def _compute_gold_router_aux_loss_from_indices(
         self,
         router_logits: tuple,
-        gold_logits: torch.Tensor,
+        gold_indices: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Compute auxiliary loss based on gold router logits.
+        Compute auxiliary loss based on gold router activated expert indices.
 
         Loss function:
         L_aux = -sum_c [y_c * I(c not in Top-k(p_c)) * log(p_c) +
@@ -146,55 +146,51 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         Args:
             router_logits: Tuple of router logits from each layer, shape: (batch, seq_len, num_experts)
-            gold_logits: Gold router logits, shape: (batch, num_layers, seq_len, num_experts)
+            gold_indices: Gold router indices, shape: (batch, num_layers, seq_len, top_k)
             attention_mask: Attention mask, shape: (batch, seq_len)
 
         Returns:
             Auxiliary loss scalar
         """
         device = router_logits[0].device
-        gold_logits = gold_logits.to(device)
+        gold_indices = gold_indices.to(device)
 
         num_layers = len(router_logits)
-        batch_size, seq_len = router_logits[0].shape[:2]
-
-        # Get model config for top_k
-        model_config = self.model.config if hasattr(self.model, "config") else self.model.module.config
-        top_k = getattr(model_config, "num_experts_per_tok", 2)
+        batch_size, seq_len, num_experts = router_logits[0].shape
+        top_k = gold_indices.shape[-1]
 
         total_loss = 0.0
         num_valid_tokens = 0
 
         for layer_idx in range(num_layers):
-            # Get current layer's router logits and gold logits
+            # Get current layer's router logits and gold indices
             current_router_logits = router_logits[layer_idx]  # (batch, seq_len, num_experts)
-            current_gold_logits = gold_logits[:, layer_idx, :, :]  # (batch, seq_len, num_experts)
+            current_gold_idx = gold_indices[:, layer_idx, :, :].long()  # (batch, seq_len, top_k)
 
-            # Get top-k experts
+            # Model top-k
             _, top_k_indices = torch.topk(current_router_logits.detach(), top_k, dim=-1)  # (batch, seq_len, top_k)
-            _, gold_top_k_indices = torch.topk(current_gold_logits, top_k, dim=-1)  # (batch, seq_len, top_k)
 
             # Indicator: is expert in model's top-k?
             in_model_topk = torch.zeros_like(current_router_logits, dtype=torch.bool)  # (batch, seq_len, num_experts)
             in_model_topk.scatter_(-1, top_k_indices, True)
 
             # Indicator: is expert in gold's top-k?
-            in_gold_topk = torch.zeros_like(current_gold_logits, dtype=torch.bool)  # (batch, seq_len, num_experts)
-            in_gold_topk.scatter_(-1, gold_top_k_indices, True)
+            in_gold_topk = torch.zeros_like(current_router_logits, dtype=torch.bool)  # (batch, seq_len, num_experts)
+            in_gold_topk.scatter_(-1, current_gold_idx, True)
 
             # Compute loss components
             # y_c * I(c not in Top-k(p_c)) * log(p_c)
             should_select_but_didnt = in_gold_topk & ~in_model_topk
             loss_missing = -torch.sum(
                 should_select_but_didnt.float() * F.softplus(current_router_logits),
-                dim=-1
+                dim=-1,
             )  # (batch, seq_len)
 
             # (1 - y_c) * I(c in Top-k(p_c)) * log(1 - p_c)
             should_not_select_but_did = ~in_gold_topk & in_model_topk
             loss_extra = -torch.sum(
                 should_not_select_but_did.float() * F.softplus(-current_router_logits),
-                dim=-1
+                dim=-1,
             )  # (batch, seq_len)
 
             layer_loss = loss_missing + loss_extra  # (batch, seq_len)

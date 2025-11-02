@@ -19,8 +19,9 @@ import fire
 import numpy as np
 import torch
 import torch.distributed as dist
-from typing import Any, Optional
-from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
+from typing import Any, Optional, Literal, cast
+from transformers.trainer_seq2seq import Seq2SeqTrainer
+from transformers.training_args_seq2seq import Seq2SeqTrainingArguments
 from typing_extensions import override
 
 from llamafactory.data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
@@ -36,12 +37,16 @@ logger = get_logger("llamafactory.scripts.extract_olmoe_routing")
 
 
 class RouterExtractionTrainer(Seq2SeqTrainer):
-    """Custom trainer for extracting router logits from MoE models."""
+    """Custom trainer for extracting activated expert indices from MoE models."""
 
     def __init__(self, output_dir: str, **kwargs):
         super().__init__(**kwargs)
         self.output_dir_routing = output_dir
-        self.all_router_logits: dict[str, np.ndarray] = {}
+        # Infer top-k from model config field `num_experts_per_tok`
+        model_config = self.model.config if hasattr(self.model, "config") else self.model.module.config
+        self.top_k = int(getattr(model_config, "num_experts_per_tok"))
+        logger.info(f"Using router top_k={self.top_k} (from model.config.num_experts_per_tok)")
+        self.all_activated_indices: dict[str, np.ndarray] = {}
 
     @override
     def prediction_step(
@@ -51,7 +56,7 @@ class RouterExtractionTrainer(Seq2SeqTrainer):
         prediction_loss_only: bool,
         ignore_keys: Optional[list[str]] = None,
     ) -> tuple[Optional[float], Optional["torch.Tensor"], Optional["torch.Tensor"]]:
-        """Override prediction_step to extract router logits."""
+        """Override prediction_step to extract activated expert indices (top-k)."""
         inputs = self._prepare_inputs(inputs)
 
         with torch.no_grad():
@@ -64,7 +69,7 @@ class RouterExtractionTrainer(Seq2SeqTrainer):
                 return_dict=True,
             )
 
-            # Extract and store router logits
+            # Extract router logits and compute top-k indices
             batch_size = inputs["input_ids"].size(0)
             seq_len = inputs["input_ids"].size(1)
             num_layers = len(outputs.router_logits)
@@ -74,19 +79,23 @@ class RouterExtractionTrainer(Seq2SeqTrainer):
             router_logits = torch.stack(outputs.router_logits, dim=0).view(num_layers, batch_size, seq_len, num_experts)
             attention_mask = inputs["attention_mask"].to(torch.bool)
 
+            # Compute top-k indices for each layer/batch/seq token
+            # Shapes: values/indices -> [num_layers, batch, seq_len, top_k]
+            _, topk_indices = torch.topk(router_logits, k=self.top_k, dim=-1)
+
             # Process each sample in the batch
             for i in range(batch_size):
-                # Filter by attention mask: [num_layers, seq_len, num_experts] -> [num_layers, valid_seq_len, num_experts]
-                sample_router_logits = router_logits[:, i, attention_mask[i], :].float().cpu().numpy()
+                # Filter by attention mask: [num_layers, seq_len, top_k] -> [num_layers, valid_seq_len, top_k]
+                sample_topk_idx = topk_indices[:, i, attention_mask[i], :].to(torch.int32).cpu().numpy()
 
                 # Store with original index as key (already in final dict format)
-                self.all_router_logits[f"sample_{original_indices[i].item()}"] = sample_router_logits
+                self.all_activated_indices[f"sample_{original_indices[i].item()}"] = sample_topk_idx
 
         # Return dummy values (we don't care about loss/predictions)
         return (None, None, None)
 
-    def save_router_logits(self, dataset_name: str):
-        """Save collected router logits in a DDP-safe way.
+    def save_activated_indices(self, dataset_name: str):
+        """Save collected activated expert indices in a DDP-safe way.
 
         - Each rank writes its own shard: {dataset}.rank{r}.npz
         - Rank 0 waits for all ranks, merges shards into {dataset}.npz, and cleans up.
@@ -98,10 +107,10 @@ class RouterExtractionTrainer(Seq2SeqTrainer):
         # Save shard for this rank
         os.makedirs(self.output_dir_routing, exist_ok=True)
         shard_path = os.path.join(self.output_dir_routing, f"{dataset_name}.rank{rank}.npz")
-        logger.info(f"Saving router logits shard (rank {rank}/{world_size}) to {shard_path}")
-        np.savez_compressed(shard_path, **self.all_router_logits)
-        logger.info(f"✓ Rank {rank}: saved {len(self.all_router_logits)} samples")
-        self.all_router_logits = {}  # Free memory after writing this shard
+        logger.info(f"Saving activated expert indices shard (rank {rank}/{world_size}) to {shard_path}")
+        np.savez(shard_path, **self.all_activated_indices)
+        logger.info(f"✓ Rank {rank}: saved {len(self.all_activated_indices)} samples")
+        self.all_activated_indices = {}  # Free memory after writing this shard
         gc.collect()  # Proactively trigger GC to free tensor/array memory
 
         # Sync all ranks before merging
@@ -122,8 +131,8 @@ class RouterExtractionTrainer(Seq2SeqTrainer):
 
             final_path = os.path.join(self.output_dir_routing, f"{dataset_name}.npz")
             logger.info(f"Merging {len(shard_paths)} shard(s) -> {final_path}")
-            np.savez_compressed(final_path, **merged)
-            logger.info(f"✓ Successfully saved {len(merged)} samples in original order to {final_path}")
+            np.savez(final_path, **merged)
+            logger.info(f"✓ Successfully saved {len(merged)} samples (activated indices) in original order to {final_path}")
             # Help the GC by dropping large temporary maps
             merged.clear()
             gc.collect()
@@ -149,7 +158,7 @@ def main(
     default_system: Optional[str] = None,
 ):
     """
-    Extract routing outputs from OLMoE model using Trainer infrastructure.
+    提取 OLMoE 模型的路由激活信息（仅保存被激活的专家索引），基于 Trainer 基础设施。
 
     Args:
         model_name_or_path: Path to the pretrained model
@@ -208,14 +217,16 @@ def main(
     assert isinstance(eval_datasets, dict), "eval_dataset should be a dict of datasets for multiple datasets."
 
     # Create data collator
+    attn_impl = cast(Literal['eager', 'sdpa', 'flash_attention_2'], getattr(model.config, "_attn_implementation", "eager"))
+    compute_dtype = cast(torch.dtype, model_args.compute_dtype if model_args.compute_dtype is not None else torch.float32)
     data_collator = SFTDataCollatorWith4DAttentionMask(
         template=template_obj,
         model=None,
         pad_to_multiple_of=None,
         label_pad_token_id=IGNORE_INDEX,
         block_diag_attn=model_args.block_diag_attn,
-        attn_implementation=getattr(model.config, "_attn_implementation", None),
-        compute_dtype=model_args.compute_dtype,
+        attn_implementation=attn_impl,
+        compute_dtype=compute_dtype,
         **tokenizer_module,
     )
 
@@ -249,12 +260,12 @@ def main(
             logger.info_rank0(f"  Shortest sequence: {lengths[-1]} tokens")
             logger.info_rank0(f"  Average length: {sum(lengths) / len(lengths):.1f} tokens")
 
-        # Run prediction to extract router logits
-        logger.info_rank0("Extracting router logits...")
+        # Run prediction to extract activated indices
+        logger.info_rank0("Extracting activated expert indices (top-k)...")
         trainer.predict(eval_dataset)  # type: ignore
 
         # Save results
-        trainer.save_router_logits(dataset_name)
+        trainer.save_activated_indices(dataset_name)
 
 
 if __name__ == "__main__":

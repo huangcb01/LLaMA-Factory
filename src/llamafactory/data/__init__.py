@@ -19,14 +19,14 @@ from .collator import (
     SFTDataCollatorWith4DAttentionMask,
 )
 from .data_utils import Role, split_dataset
-from .gold_router_loader import GoldRouterLogitsLoader, get_gold_router_loader, initialize_gold_router_loader
+from .gold_router_loader import GoldRouterIndicesLoader, get_gold_router_loader, initialize_gold_router_loader
 from .loader import get_dataset
 from .template import TEMPLATES, Template, get_template_and_fix_tokenizer
 
 
 __all__ = [
     "TEMPLATES",
-    "GoldRouterLogitsLoader",
+    "GoldRouterIndicesLoader",
     "KTODataCollatorWithPadding",
     "MultiModalDataCollatorForSeq2Seq",
     "PairwiseDataCollatorWithPadding",
