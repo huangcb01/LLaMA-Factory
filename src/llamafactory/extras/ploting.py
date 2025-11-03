@@ -47,49 +47,96 @@ def smooth(scalars: list[float]) -> list[float]:
 
 
 def gen_loss_plot(trainer_log: list[dict[str, Any]]) -> "matplotlib.figure.Figure":
-    r"""Plot loss curves in LlamaBoard."""
+    r"""Plot loss curves (total, LM, gold_router_aux) in LlamaBoard on a single figure."""
     plt.close("all")
     plt.switch_backend("agg")
     fig = plt.figure()
     ax = fig.add_subplot(111)
-    steps, losses = [], []
-    for log in trainer_log:
-        if log.get("loss", None):
-            steps.append(log["current_steps"])
-            losses.append(log["loss"])
 
-    ax.plot(steps, losses, color="#1f77b4", alpha=0.4, label="original")
-    ax.plot(steps, smooth(losses), color="#1f77b4", label="smoothed")
+    steps_total, steps_lm, steps_aux = [], [], []
+    total, lm, aux = [], [], []
+    for log in trainer_log:
+        step = log.get("current_steps")
+        if step is None:
+            continue
+        # collect if present (track independent step axes)
+        if log.get("loss") is not None:
+            steps_total.append(step)
+            total.append(log["loss"])
+        if log.get("lm_loss") is not None:
+            steps_lm.append(step)
+            lm.append(log["lm_loss"])
+        if log.get("gold_router_aux_loss") is not None:
+            steps_aux.append(step)
+            aux.append(log["gold_router_aux_loss"])
+
+    # plot available series
+    plotted = False
+    if len(total) > 0:
+        ax.plot(steps_total, total, color="#1f77b4", alpha=0.25, label="total (raw)")
+        ax.plot(steps_total, smooth(total), color="#1f77b4", label="total")
+        plotted = True
+    if len(lm) > 0:
+        ax.plot(steps_lm, lm, color="#2ca02c", alpha=0.25, label="lm (raw)")
+        ax.plot(steps_lm, smooth(lm), color="#2ca02c", label="lm")
+        plotted = True
+    if len(aux) > 0:
+        ax.plot(steps_aux, aux, color="#d62728", alpha=0.25, label="gold_router_aux (raw)")
+        ax.plot(steps_aux, smooth(aux), color="#d62728", label="gold_router_aux")
+        plotted = True
+
+    if not plotted:
+        ax.text(0.5, 0.5, "No loss metrics available", ha="center", va="center", transform=ax.transAxes)
+
     ax.legend()
     ax.set_xlabel("step")
     ax.set_ylabel("loss")
+    ax.set_title("Training losses")
     return fig
 
 
-def plot_loss(save_dictionary: str, keys: list[str] = ["loss"]) -> None:
-    r"""Plot loss curves and saves the image."""
+def plot_loss(save_dictionary: str, keys: list[str] = ["loss", "lm_loss", "gold_router_aux_loss"]) -> None:
+    r"""Plot multiple loss curves on one image and save it.
+
+    Falls back gracefully for missing keys.
+    """
     plt.switch_backend("agg")
     with open(os.path.join(save_dictionary, TRAINER_STATE_NAME), encoding="utf-8") as f:
         data = json.load(f)
 
+    # collect metrics
+    series: dict[str, tuple[list[int], list[float]]] = {}
     for key in keys:
         steps, metrics = [], []
         for i in range(len(data["log_history"])):
             if key in data["log_history"][i]:
                 steps.append(data["log_history"][i]["step"])
                 metrics.append(data["log_history"][i][key])
-
         if len(metrics) == 0:
             logger.warning_rank0(f"No metric {key} to plot.")
             continue
+        series[key] = (steps, metrics)
 
-        plt.figure()
-        plt.plot(steps, metrics, color="#1f77b4", alpha=0.4, label="original")
-        plt.plot(steps, smooth(metrics), color="#1f77b4", label="smoothed")
-        plt.title(f"training {key} of {save_dictionary}")
-        plt.xlabel("step")
-        plt.ylabel(key)
-        plt.legend()
-        figure_path = os.path.join(save_dictionary, "training_{}.png".format(key.replace("/", "_")))
-        plt.savefig(figure_path, format="png", dpi=100)
-        print("Figure saved at:", figure_path)
+    if len(series) == 0:
+        logger.warning_rank0("No metrics available to plot.")
+        return
+
+    # make a single figure with multiple lines
+    plt.figure()
+    color_map = {
+        "loss": "#1f77b4",
+        "lm_loss": "#2ca02c",
+        "gold_router_aux_loss": "#d62728",
+    }
+    for key, (steps, metrics) in series.items():
+        color = color_map.get(key, None)
+        plt.plot(steps, metrics, color=color, alpha=0.25, label=f"{key} (raw)")
+        plt.plot(steps, smooth(metrics), color=color, label=f"{key}")
+
+    plt.title(f"training losses of {save_dictionary}")
+    plt.xlabel("step")
+    plt.ylabel("loss")
+    plt.legend()
+    figure_path = os.path.join(save_dictionary, "training_losses.png")
+    plt.savefig(figure_path, format="png", dpi=100)
+    print("Figure saved at:", figure_path)

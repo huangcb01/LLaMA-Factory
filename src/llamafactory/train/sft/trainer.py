@@ -17,13 +17,14 @@
 
 import json
 import os
+from collections import defaultdict
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import Seq2SeqTrainer
+from transformers import Seq2SeqTrainer, Trainer
 from typing_extensions import override
 
 from ...extras import logging
@@ -94,6 +95,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         if model_args is not None and model_args.fp8 and hasattr(self, "accelerator"):
             verify_fp8_status(self.accelerator, model_args)
 
+        # buffer for custom metrics (per split) to be reduced/logged in `log`
+        self._stored_metrics = defaultdict(lambda: defaultdict(list))
+
     @override
     def create_optimizer(self) -> "torch.optim.Optimizer":
         if self.optimizer is None:
@@ -116,20 +120,87 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
     @override
     def compute_loss(self, model, inputs, *args, **kwargs):
+        # Detect split by model mode
+        split = "train" if model.training else "eval"
+
         if self.finetuning_args.moe_router_loss_weight > 0.0:
             inputs["output_router_logits"] = True
             outputs = model(**inputs)
-            loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
+            lm_loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
             gold_indices = inputs.pop("gold_router_indices")
             aux_loss = self._compute_gold_router_aux_loss_from_indices(
                 outputs.router_logits,
                 gold_indices,
                 inputs.get("attention_mask", None),
             )
-            loss = loss + self.finetuning_args.moe_router_loss_weight * aux_loss
+            # total loss = lm + weight * aux
+            loss = lm_loss + self.finetuning_args.moe_router_loss_weight * aux_loss
+
+            # store per-step metrics for later logging (with ddp reduction)
+            try:
+                self._stored_metrics[split]["lm_loss"].append(lm_loss.detach().float().mean().item())
+                self._stored_metrics[split]["gold_router_aux_loss"].append(aux_loss.detach().float().mean().item())
+                self._stored_metrics[split]["total_loss"].append(loss.detach().float().mean().item())
+            except Exception:
+                # best-effort; don't break training on logging issues
+                pass
             return loss
         else:
-            return super().compute_loss(model, inputs, *args, **kwargs)
+            # no aux router loss; still log lm (equals total)
+            base_loss = super().compute_loss(model, inputs, *args, **kwargs)
+            try:
+                val = base_loss.detach().float().mean().item()
+                self._stored_metrics[split]["lm_loss"].append(val)
+                self._stored_metrics[split]["total_loss"].append(val)
+            except Exception:
+                pass
+            return base_loss
+
+    @override
+    def log(self, logs: dict[str, float], *args, **kwargs) -> None:
+        """Log `logs` on the various objects watching training, including stored metrics.
+
+        We aggregate and all-reduce custom losses (lm_loss, gold_router_aux_loss, total_loss)
+        and inject them into the log history so that both trainer_state.json and
+        trainer_log.jsonl contain these metrics for plotting.
+        """
+        # Decide split and prefix based on presence of loss keys
+        train_eval = "train" if "loss" in logs else "eval"
+        prefix = "eval_" if train_eval == "eval" else ""
+
+        # Nothing to add
+        if len(self._stored_metrics[train_eval]) == 0:
+            return super().log(logs, *args, **kwargs)
+
+        # Gather keys and values, pad to fixed length for safe all-reduce
+        key_list, metric_list = [], []
+        for key, values in self._stored_metrics[train_eval].items():
+            key_list.append(key)
+            # average within process first
+            try:
+                metric_list.append(torch.tensor(values, dtype=torch.float, device=self.accelerator.device).mean().item())
+            except Exception:
+                # fallback to python average
+                metric_list.append(float(sum(values) / max(len(values), 1)))
+
+        # clear stored metrics for this split
+        del self._stored_metrics[train_eval]
+
+        # pad to at least 4 to avoid potential collective issues
+        while len(metric_list) < 4:
+            key_list.append(f"dummy_{len(metric_list)}")
+            metric_list.append(0.0)
+
+        tensor_metrics = torch.tensor(metric_list, dtype=torch.float, device=self.accelerator.device)
+        # all-reduce (mean across processes)
+        reduced = self.accelerator.reduce(tensor_metrics, "mean").tolist()
+
+        # write back to logs with prefix for eval
+        for key, metric in zip(key_list, reduced):
+            if not key.startswith("dummy_"):
+                logs[f"{prefix}{key}"] = metric
+
+        return Trainer.log(self, logs, *args, **kwargs)
 
     def _compute_gold_router_aux_loss_from_indices(
         self,
