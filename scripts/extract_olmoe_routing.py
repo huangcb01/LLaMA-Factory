@@ -13,7 +13,10 @@
 # limitations under the License.
 
 import os
+import glob
 import gc
+from io import BytesIO
+from zipfile import ZipFile, ZIP_DEFLATED
 import datasets
 import fire
 import numpy as np
@@ -23,6 +26,7 @@ from typing import Any, Optional, Literal, cast
 from transformers.trainer_seq2seq import Seq2SeqTrainer
 from transformers.training_args_seq2seq import Seq2SeqTrainingArguments
 from typing_extensions import override
+from numpy.lib.format import write_array
 
 from llamafactory.data import SFTDataCollatorWith4DAttentionMask, get_dataset, get_template_and_fix_tokenizer
 from llamafactory.extras.constants import IGNORE_INDEX
@@ -39,14 +43,27 @@ logger = get_logger("llamafactory.scripts.extract_olmoe_routing")
 class RouterExtractionTrainer(Seq2SeqTrainer):
     """Custom trainer for extracting activated expert indices from MoE models."""
 
-    def __init__(self, output_dir: str, **kwargs):
+    def __init__(self, output_dir: str, save_interval: int = 2000, **kwargs):
         super().__init__(**kwargs)
         self.output_dir_routing = output_dir
+        self.save_interval = int(save_interval)
         # Infer top-k from model config field `num_experts_per_tok`
-        model_config = self.model.config if hasattr(self.model, "config") else self.model.module.config
+        model_holder = getattr(self, "model")
+        model_container = getattr(model_holder, "module", model_holder)
+        model_config = getattr(model_holder, "config", None) or getattr(model_container, "config")
         self.top_k = int(getattr(model_config, "num_experts_per_tok"))
         logger.info(f"Using router top_k={self.top_k} (from model.config.num_experts_per_tok)")
         self.all_activated_indices: dict[str, np.ndarray] = {}
+        # State for incremental saving per dataset
+        self.current_dataset_name: Optional[str] = None
+        self._part_idx: int = 0
+
+    def start_dataset(self, dataset_name: str):
+        """Initialize internal state for a new dataset pass."""
+        self.current_dataset_name = dataset_name
+        self._part_idx = 0
+        self.all_activated_indices.clear()
+        gc.collect()
 
     @override
     def prediction_step(
@@ -91,8 +108,36 @@ class RouterExtractionTrainer(Seq2SeqTrainer):
                 # Store with original index as key (already in final dict format)
                 self.all_activated_indices[f"sample_{original_indices[i].item()}"] = sample_topk_idx
 
+            # Incremental flush to avoid large shards in memory
+            if self.save_interval > 0 and len(self.all_activated_indices) >= self.save_interval:
+                self._flush_partial_shard()
+
         # Return dummy values (we don't care about loss/predictions)
         return (None, None, None)
+
+    def _get_dist_info(self) -> tuple[int, int]:
+        dist_available = dist.is_available() and dist.is_initialized()
+        rank = dist.get_rank() if dist_available else 0
+        world_size = dist.get_world_size() if dist_available else 1
+        return rank, world_size
+
+    def _flush_partial_shard(self):
+        """Write current buffer to a part shard file and clear buffer."""
+        assert self.current_dataset_name is not None, "current_dataset_name is not set. Call start_dataset() first."
+        rank, _ = self._get_dist_info()
+        os.makedirs(self.output_dir_routing, exist_ok=True)
+        shard_path = os.path.join(
+            self.output_dir_routing,
+            f"{self.current_dataset_name}.rank{rank}.part{self._part_idx}.npz",
+        )
+        logger.info(
+            f"Saving partial activated expert indices shard (rank {rank}) part {self._part_idx} "
+            f"with {len(self.all_activated_indices)} sample(s) -> {shard_path}"
+        )
+        np.savez(shard_path, **self.all_activated_indices)
+        self._part_idx += 1
+        self.all_activated_indices.clear()
+        gc.collect()
 
     def save_activated_indices(self, dataset_name: str):
         """Save collected activated expert indices in a DDP-safe way.
@@ -100,44 +145,51 @@ class RouterExtractionTrainer(Seq2SeqTrainer):
         - Each rank writes its own shard: {dataset}.rank{r}.npz
         - Rank 0 waits for all ranks, merges shards into {dataset}.npz, and cleans up.
         """
-        dist_available = dist.is_available() and dist.is_initialized()
-        rank = dist.get_rank() if dist_available else 0
-        world_size = dist.get_world_size() if dist_available else 1
+        rank, world_size = self._get_dist_info()
 
-        # Save shard for this rank
-        os.makedirs(self.output_dir_routing, exist_ok=True)
-        shard_path = os.path.join(self.output_dir_routing, f"{dataset_name}.rank{rank}.npz")
-        logger.info(f"Saving activated expert indices shard (rank {rank}/{world_size}) to {shard_path}")
-        np.savez(shard_path, **self.all_activated_indices)
-        logger.info(f"✓ Rank {rank}: saved {len(self.all_activated_indices)} samples")
-        self.all_activated_indices = {}  # Free memory after writing this shard
-        gc.collect()  # Proactively trigger GC to free tensor/array memory
+        # Flush remaining buffer in the last part (if any)
+        self.current_dataset_name = dataset_name  # ensure set for manual calls
+        if len(self.all_activated_indices) > 0:
+            self._flush_partial_shard()
 
         # Sync all ranks before merging
+        dist_available = dist.is_available() and dist.is_initialized()
         if dist_available:
             dist.barrier()
 
-        # Merge shards on rank 0
+        # Merge shards on rank 0 using streaming write to avoid OOM
         if (not dist_available) or rank == 0:
-            merged = {}
-            shard_paths = []
+            # Collect all part shard paths from all ranks
+            shard_paths: list[str] = []
             for r in range(world_size):
-                p = os.path.join(self.output_dir_routing, f"{dataset_name}.rank{r}.npz")
-                # Ensure the NPZ file is closed immediately after reading to release file/memory resources
-                with np.load(p, allow_pickle=False) as data:
-                    for k in data.files:
-                        merged[k] = data[k]
-                shard_paths.append(p)
+                pattern = os.path.join(self.output_dir_routing, f"{dataset_name}.rank{r}.part*.npz")
+                part_paths = sorted(glob.glob(pattern))
+                shard_paths.extend(part_paths)
 
             final_path = os.path.join(self.output_dir_routing, f"{dataset_name}.npz")
-            logger.info(f"Merging {len(shard_paths)} shard(s) -> {final_path}")
-            np.savez(final_path, **merged)
-            logger.info(f"✓ Successfully saved {len(merged)} samples (activated indices) in original order to {final_path}")
-            # Help the GC by dropping large temporary maps
-            merged.clear()
+            logger.info(
+                f"Merging {len(shard_paths)} shard part(s) -> {final_path} using streaming write to prevent OOM"
+            )
+
+            total_samples = 0
+            with ZipFile(final_path, mode="w", compression=ZIP_DEFLATED) as zf:
+                for p in shard_paths:
+                    with np.load(p, allow_pickle=False) as data:
+                        for k in data.files:
+                            arr = data[k]
+                            bio = BytesIO()
+                            write_array(bio, arr, allow_pickle=False)
+                            zf.writestr(f"{k}.npy", bio.getvalue())
+                            total_samples += 1
+                            # Explicitly drop references
+                            del arr, bio
+
+            logger.info(
+                f"✓ Successfully saved {total_samples} samples (activated indices) to {final_path}"
+            )
             gc.collect()
 
-            # Cleanup shard files
+            # Cleanup shard part files
             for p in shard_paths:
                 try:
                     os.remove(p)
@@ -156,6 +208,7 @@ def main(
     output_dir: str = "routing_outputs",
     batch_size: int = 4,
     default_system: Optional[str] = None,
+    save_interval: int = 2000,
 ):
     """
     提取 OLMoE 模型的路由激活信息（仅保存被激活的专家索引），基于 Trainer 基础设施。
@@ -170,7 +223,8 @@ def main(
         max_samples: Maximum number of samples to process
         output_dir: Output directory for routing results
         batch_size: Batch size for processing
-        default_system: Default system message
+    default_system: Default system message
+    save_interval: 每多少个样本落盘一次分片，默认为 2000
     """
     model_args, data_args, finetuning_args, _ = get_infer_args(
         dict(
@@ -236,6 +290,7 @@ def main(
         args=training_args,
         data_collator=data_collator,
         output_dir=output_dir,
+        save_interval=save_interval,
         tokenizer=tokenizer,
     )
 
@@ -261,6 +316,8 @@ def main(
             logger.info_rank0(f"  Average length: {sum(lengths) / len(lengths):.1f} tokens")
 
         # Run prediction to extract activated indices
+        # Initialize trainer state for this dataset
+        trainer.start_dataset(dataset_name)
         logger.info_rank0("Extracting activated expert indices (top-k)...")
         trainer.predict(eval_dataset)  # type: ignore
 
