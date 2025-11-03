@@ -121,6 +121,35 @@ class RouterExtractionTrainer(Seq2SeqTrainer):
         world_size = dist.get_world_size() if dist_available else 1
         return rank, world_size
 
+    def _barrier(self):
+        """Robust distributed barrier.
+
+        When using NCCL backend, provide device_ids to avoid warnings/hangs and
+        synchronize CUDA stream before entering the collective.
+        """
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        try:
+            backend = dist.get_backend()
+        except Exception:
+            backend = None
+
+        if backend == "nccl":
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+                try:
+                    dist.barrier(device_ids=[torch.cuda.current_device()])
+                    return
+                except Exception as e:
+                    logger.warning(f"NCCL barrier with device_ids failed: {e}. Falling back to default barrier().")
+            # Fallback if CUDA not available or previous call failed
+            dist.barrier()
+        else:
+            dist.barrier()
+
     def _flush_partial_shard(self):
         """Write current buffer to a part shard file and clear buffer."""
         assert self.current_dataset_name is not None, "current_dataset_name is not set. Call start_dataset() first."
@@ -153,12 +182,12 @@ class RouterExtractionTrainer(Seq2SeqTrainer):
             self._flush_partial_shard()
 
         # Sync all ranks before merging
-        dist_available = dist.is_available() and dist.is_initialized()
-        if dist_available:
-            dist.barrier()
+        logger.info(f"Rank {rank}: entering barrier before merge for dataset '{dataset_name}'")
+        self._barrier()
+        logger.info(f"Rank {rank}: passed barrier, proceeding to merge check for dataset '{dataset_name}'")
 
         # Merge shards on rank 0 using streaming write to avoid OOM
-        if (not dist_available) or rank == 0:
+        if (not (dist.is_available() and dist.is_initialized())) or rank == 0:
             # Collect all part shard paths from all ranks
             shard_paths: list[str] = []
             for r in range(world_size):
