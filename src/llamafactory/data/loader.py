@@ -54,6 +54,7 @@ def _load_single_dataset(
     model_args: "ModelArguments",
     data_args: "DataArguments",
     training_args: "Seq2SeqTrainingArguments",
+    dataset_name: Optional[str] = None,
 ) -> Union["Dataset", "IterableDataset"]:
     r"""Load a single dataset and aligns it to the standard format."""
     logger.info_rank0(f"Loading dataset {dataset_attr}...")
@@ -160,7 +161,36 @@ def _load_single_dataset(
         max_samples = min(data_args.max_samples, len(dataset))
         dataset = dataset.select(range(max_samples))
 
-    return align_dataset(dataset, dataset_attr, data_args, training_args)
+    # Align to standard format first (no reordering expected)
+    dataset = align_dataset(dataset, dataset_attr, data_args, training_args)
+
+    # Add gold router activated expert indices per sample if available and not streaming
+    # We attach indices here at single-dataset granularity to avoid ambiguity after merging.
+    if (not data_args.streaming) and dataset_name is not None:
+        try:
+            from .gold_router_loader import get_gold_router_loader
+
+            loader = get_gold_router_loader()
+            if loader is not None and loader.has_gold_indices(dataset_name):
+                def add_indices(examples, indices):
+                    gold_indices_list = []
+                    for idx in indices:
+                        inds = loader.get_sample_indices(dataset_name, idx)
+                        # store as numpy array if available, else None to keep alignment
+                        gold_indices_list.append(None if inds is None else inds.numpy())
+                    examples["gold_router_indices"] = gold_indices_list
+                    return examples
+
+                dataset = dataset.map(
+                    add_indices,
+                    batched=True,
+                    with_indices=True,
+                )
+                logger.info_rank0(f"Added gold router indices to dataset '{dataset_name}' at load stage.")
+        except Exception as e:
+            logger.warning_rank0(f"Failed to add gold router indices for '{dataset_name}': {e}")
+
+    return dataset
 
 
 def _get_merged_dataset(
@@ -180,7 +210,7 @@ def _get_merged_dataset(
         if (stage == "rm" and dataset_attr.ranking is False) or (stage != "rm" and dataset_attr.ranking is True):
             raise ValueError("The dataset is not applicable in the current training stage.")
 
-        dataset = _load_single_dataset(dataset_attr, model_args, data_args, training_args)
+        dataset = _load_single_dataset(dataset_attr, model_args, data_args, training_args, dataset_name=dataset_name)
 
         # Add dataset_name and sample_idx metadata to each sample for later gold logits loading
         if not data_args.streaming:
@@ -242,39 +272,6 @@ def _get_dataset_processor(
     return dataset_processor_class(template=template, tokenizer=tokenizer, processor=processor, data_args=data_args)
 
 
-def _add_gold_router_indices(
-    dataset: Union["Dataset", "IterableDataset"],
-    dataset_name: str,
-) -> Union["Dataset", "IterableDataset"]:
-    r"""Add gold router activated expert indices to dataset if available."""
-    from .gold_router_loader import get_gold_router_loader
-
-    loader = get_gold_router_loader()
-    if loader is None or not loader.has_gold_indices(dataset_name):
-        return dataset
-
-    def add_indices(examples, indices):
-        # For each sample in the batch, load its gold router indices
-        gold_indices_list = []
-        for idx in indices:
-            inds = loader.get_sample_indices(dataset_name, idx)
-            gold_indices_list.append(inds.numpy())  # Store as numpy for dataset
-
-        examples["gold_router_indices"] = gold_indices_list
-        return examples
-
-    # Add gold logits as a new column
-    dataset = dataset.map(
-        add_indices,
-        batched=True,
-        with_indices=True,
-        desc=f"Adding gold router indices for {dataset_name}",
-    )
-
-    logger.info_rank0(f"Added gold router indices to dataset '{dataset_name}'.")
-    return dataset
-
-
 def _get_preprocessed_dataset(
     dataset: Optional[Union["Dataset", "IterableDataset"]],
     data_args: "DataArguments",
@@ -302,6 +299,11 @@ def _get_preprocessed_dataset(
             desc="Running tokenizer on dataset",
         )
 
+    # Preserve special columns added earlier
+    for special_col in ["gold_router_indices"]:
+        if special_col in column_names:
+            column_names.remove(special_col)
+
     dataset = dataset.map(
         dataset_processor.preprocess_dataset,
         batched=True,
@@ -309,10 +311,6 @@ def _get_preprocessed_dataset(
         remove_columns=column_names,
         **kwargs,
     )
-
-    # Add gold router indices if available
-    if dataset_name is not None and not data_args.streaming:
-        dataset = _add_gold_router_indices(dataset, dataset_name)
 
     if training_args.should_log:
         try:
