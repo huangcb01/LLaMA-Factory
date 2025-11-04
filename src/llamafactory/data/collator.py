@@ -108,25 +108,30 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
         batch_images, batch_videos, batch_audios = [], [], []
         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
-        gold_router_indices_list = []
-
-        #  Load gold router indices if available
-        from .gold_router_loader import get_gold_router_loader
-        loader = get_gold_router_loader()
+        gold_router_indices_per_sample: list[Optional[torch.Tensor]] = []
 
         for feature in features:
             images = feature.pop("images", None) or []
             videos = feature.pop("videos", None) or []
             audios = feature.pop("audios", None) or []
 
-            # Try to load gold router indices if loader is available
+            # Remove metadata keys to avoid default collation; keep for fallback
             dataset_name = feature.pop("_dataset_name", None)
             sample_idx = feature.pop("_sample_idx", None)
-            if loader is not None and dataset_name is not None and sample_idx is not None:
-                if loader.has_gold_indices(dataset_name):
-                    gold_indices = loader.get_sample_indices(dataset_name, sample_idx)
-                    if gold_indices is not None:
-                        gold_router_indices_list.append(gold_indices)
+
+            # Try to use pre-attached gold router indices column first
+            gold_col = feature.pop("gold_router_indices", None)
+            gold_tensor: Optional[torch.Tensor] = None
+            if gold_col is not None:
+                try:
+                    if isinstance(gold_col, np.ndarray):
+                        gold_tensor = torch.from_numpy(gold_col).to(torch.long)
+                    else:
+                        gold_tensor = torch.tensor(gold_col, dtype=torch.long)
+                except Exception:
+                    gold_tensor = None
+
+            gold_router_indices_per_sample.append(gold_tensor)
 
             batch_images.extend(images)
             batch_videos.extend(videos)
@@ -249,10 +254,28 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
 
         features.update(mm_inputs)
 
-        # Add gold router indices if available
-        if len(gold_router_indices_list) > 0:
-            # Stack indices: [batch_size, num_layers, seq_len, top_k]
-            features["gold_router_indices"] = torch.stack(gold_router_indices_list, dim=0)
+        # Add gold router indices if available: pad/truncate per-sample to batch max length
+        if any(t is not None for t in gold_router_indices_per_sample):
+            max_len = features["input_ids"].size(1)
+            batch_tensors: list[torch.Tensor] = []
+            for t in gold_router_indices_per_sample:
+                if t is None:
+                    raise ValueError(
+                        "gold_router_indices is required for all samples when moe_router_loss is enabled."
+                    )
+                # t: [num_layers, seq_len, top_k]
+                num_layers, seq_len, top_k = t.shape
+                if seq_len > max_len:
+                    t = t[:, :max_len, :]
+                    seq_len = max_len
+                if seq_len < max_len:
+                    padded = t.new_zeros((num_layers, max_len, top_k))
+                    padded[:, :seq_len, :] = t
+                    t = padded
+                batch_tensors.append(t)
+
+            # Stack: [batch_size, num_layers, max_len, top_k]
+            features["gold_router_indices"] = torch.stack(batch_tensors, dim=0)
 
         if "image_bound" in features:  # for minicpmv inputs
             bsz, seq_length = features["input_ids"].shape
