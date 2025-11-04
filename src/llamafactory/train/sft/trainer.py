@@ -128,10 +128,20 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             outputs = model(**inputs)
             lm_loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
             gold_indices = inputs.pop("gold_router_indices")
+            # Build a robust 2D mask from labels when available; fallback to 2D attention_mask
+            mask2d = None
+            labels = inputs.get("labels", None)
+            if labels is not None and labels.dim() == 2:
+                mask2d = (labels != IGNORE_INDEX).float()
+            else:
+                am = inputs.get("attention_mask", None)
+                if am is not None and am.dim() == 2:
+                    mask2d = am.float()
+
             aux_loss = self._compute_gold_router_aux_loss_from_indices(
                 outputs.router_logits,
                 gold_indices,
-                inputs.get("attention_mask", None),
+                mask2d,
             )
             # total loss = lm + weight * aux
             loss = lm_loss + self.finetuning_args.moe_router_loss_weight * aux_loss
@@ -216,7 +226,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                         (1 - y_c) * I(c in Top-k(p_c)) * log(1 - p_c)]
 
         Args:
-            router_logits: Tuple of router logits from each layer, shape: (batch, seq_len, num_experts)
+            router_logits: Tuple of router logits from each layer, shape: (batch*seq_len, num_experts)
             gold_indices: Gold router indices, shape: (batch, num_layers, seq_len, top_k)
             attention_mask: Attention mask, shape: (batch, seq_len)
 
@@ -225,61 +235,40 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         """
         device = router_logits[0].device
         gold_indices = gold_indices.to(device)
+        batch_size, num_layers, seq_len, top_k = gold_indices.shape
 
-        num_layers = len(router_logits)
-        batch_size, seq_len, num_experts = router_logits[0].shape
-        top_k = gold_indices.shape[-1]
+        # Stack layers -> (B, S, L, E)
+        logits = torch.stack([r.view(batch_size, seq_len, -1) for r in router_logits], dim=2)
+        gold_indices = gold_indices.permute(0, 2, 1, 3).contiguous()  # (B, S, L, K)
 
-        total_loss = 0.0
-        num_valid_tokens = 0
+        # Top-k from model per (B,S,L)
+        _, topk_idx = torch.topk(logits.detach(), k=top_k, dim=-1)  # (B, S, L, K)
 
-        for layer_idx in range(num_layers):
-            # Get current layer's router logits and gold indices
-            current_router_logits = router_logits[layer_idx]  # (batch, seq_len, num_experts)
-            current_gold_idx = gold_indices[:, layer_idx, :, :].long()  # (batch, seq_len, top_k)
+        # Build boolean masks (B, S, L, E)
+        in_model_topk = torch.zeros_like(logits, dtype=torch.bool)
+        in_model_topk.scatter_(-1, topk_idx, True)
 
-            # Model top-k
-            _, top_k_indices = torch.topk(current_router_logits.detach(), top_k, dim=-1)  # (batch, seq_len, top_k)
+        in_gold_topk = torch.zeros_like(logits, dtype=torch.bool)
+        in_gold_topk.scatter_(-1, gold_indices.long(), True)
 
-            # Indicator: is expert in model's top-k?
-            in_model_topk = torch.zeros_like(current_router_logits, dtype=torch.bool)  # (batch, seq_len, num_experts)
-            in_model_topk.scatter_(-1, top_k_indices, True)
+        # Loss components along expert dimension
+        loss_missing = -((in_gold_topk & ~in_model_topk).float() * F.softplus(logits)).sum(dim=-1)  # (B, S, L)
+        loss_extra = -((~in_gold_topk & in_model_topk).float() * F.softplus(-logits)).sum(dim=-1)  # (B, S, L)
+        token_layer_loss = loss_missing + loss_extra  # (B, S, L)
 
-            # Indicator: is expert in gold's top-k?
-            in_gold_topk = torch.zeros_like(current_router_logits, dtype=torch.bool)  # (batch, seq_len, num_experts)
-            in_gold_topk.scatter_(-1, current_gold_idx, True)
+        # Mask PAD tokens using 2D attention mask
+        if attention_mask is not None:
+            mask2d = attention_mask.float()  # expected shape (B, S)
+            token_layer_loss = token_layer_loss * mask2d.unsqueeze(-1)  # (B, S, L)
+            num_valid_tokens = mask2d.sum().item() * num_layers
+        else:
+            logger.warning_rank0("No 2D attention mask provided; using all tokens (including padding) for aux loss.")
+            num_valid_tokens = float(batch_size * seq_len * num_layers)
 
-            # Compute loss components
-            # y_c * I(c not in Top-k(p_c)) * log(p_c)
-            should_select_but_didnt = in_gold_topk & ~in_model_topk
-            loss_missing = -torch.sum(
-                should_select_but_didnt.float() * F.softplus(current_router_logits),
-                dim=-1,
-            )  # (batch, seq_len)
-
-            # (1 - y_c) * I(c in Top-k(p_c)) * log(1 - p_c)
-            should_not_select_but_did = ~in_gold_topk & in_model_topk
-            loss_extra = -torch.sum(
-                should_not_select_but_did.float() * F.softplus(-current_router_logits),
-                dim=-1,
-            )  # (batch, seq_len)
-
-            layer_loss = loss_missing + loss_extra  # (batch, seq_len)
-
-            # Apply attention mask if available
-            if attention_mask is not None:
-                layer_loss = layer_loss * attention_mask
-                num_valid_tokens += attention_mask.sum().item()
-            else:
-                num_valid_tokens += batch_size * seq_len
-
-            total_loss += layer_loss.sum()
-
-        # Average over all tokens and layers
+        total_loss = token_layer_loss.sum()
         if num_valid_tokens > 0:
             return total_loss / num_valid_tokens
-        else:
-            return torch.tensor(0.0, device=device)
+        return torch.tensor(0.0, device=device)
 
     @override
     def prediction_step(
