@@ -119,7 +119,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return super()._get_train_sampler(*args, **kwargs)
 
     @override
-    def compute_loss(self, model, inputs, *args, **kwargs):
+    def compute_loss(self, model, inputs, return_outputs: bool = False):
         # Detect split by model mode
         split = "train" if model.training else "eval"
 
@@ -154,17 +154,29 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             except Exception:
                 # best-effort; don't break training on logging issues
                 pass
+            if return_outputs:
+                return loss, outputs
             return loss
         else:
             # no aux router loss; still log lm (equals total)
-            base_loss = super().compute_loss(model, inputs, *args, **kwargs)
-            try:
-                val = base_loss.detach().float().mean().item()
-                self._stored_metrics[split]["lm_loss"].append(val)
-                self._stored_metrics[split]["total_loss"].append(val)
-            except Exception:
-                pass
-            return base_loss
+            if return_outputs:
+                base_loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
+                try:
+                    val = base_loss.detach().float().mean().item()
+                    self._stored_metrics[split]["lm_loss"].append(val)
+                    self._stored_metrics[split]["total_loss"].append(val)
+                except Exception:
+                    pass
+                return base_loss, outputs
+            else:
+                base_loss = super().compute_loss(model, inputs, return_outputs=False)
+                try:
+                    val = base_loss.detach().float().mean().item()
+                    self._stored_metrics[split]["lm_loss"].append(val)
+                    self._stored_metrics[split]["total_loss"].append(val)
+                except Exception:
+                    pass
+                return base_loss
 
     @override
     def log(self, logs: dict[str, float], *args, **kwargs) -> None:
