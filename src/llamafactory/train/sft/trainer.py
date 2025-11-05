@@ -122,7 +122,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
     def compute_loss(self, model, inputs, return_outputs: bool = False, num_items_in_batch: Optional[int] = None):
         # Detect split by model mode
         split = "train" if model.training else "eval"
-        gold_indices = inputs.pop("gold_router_indices")
+        gold_indices = inputs.pop("gold_router_indices", None)
         inputs["output_router_logits"] = True
         inputs["return_dict"] = True
         if self.model_accepts_loss_kwargs and num_items_in_batch is not None:
@@ -133,8 +133,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         outputs = model(**inputs)
         loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
         self._stored_metrics[split]["lm_loss"].append(loss.detach().float().mean().item() * loss_log_multiplier)
-        if self.finetuning_args.moe_router_loss_weight > 0.0:
-            aux_loss = self._compute_gold_router_aux_loss_from_indices(
+        if gold_indices is not None:
+            aux_loss, router_acc = self._compute_gold_router_aux_loss_from_indices(
                 outputs.router_logits,
                 gold_indices,
                 inputs["attention_mask"],
@@ -143,6 +143,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             loss = loss + self.finetuning_args.moe_router_loss_weight * aux_loss
             self._stored_metrics[split]["gold_router_aux_loss"].append(aux_loss.detach().float().mean().item() * loss_log_multiplier)
             self._stored_metrics[split]["total_loss"].append(loss.detach().float().mean().item() * loss_log_multiplier)
+            self._stored_metrics[split]["router_topk_acc"].append(
+                router_acc.detach().float().mean().item() * loss_log_multiplier
+            )
         if return_outputs:
             return loss, outputs
         return loss
@@ -199,13 +202,16 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         gold_indices: torch.Tensor,
         attention_mask: torch.Tensor,
         num_items_in_batch: Optional[int] = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute auxiliary loss based on gold router activated expert indices.
+        Compute auxiliary loss and Top-K accuracy based on gold router activated expert indices.
 
         Loss function:
         L_aux = -sum_c [y_c * I(c not in Top-k(p_c)) * log(p_c) +
                         (1 - y_c) * I(c in Top-k(p_c)) * log(1 - p_c)]
+
+        Router Top-K accuracy (per token, per layer):
+            acc = |TopK_model ∩ TopK_gold| / K
 
         Args:
             router_logits: Tuple of router logits from each layer, shape: (batch*seq_len, num_experts)
@@ -213,7 +219,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
             attention_mask: Attention mask, shape: (batch, seq_len)
 
         Returns:
-            Auxiliary loss scalar
+            A tuple of (auxiliary loss scalar, router top-k accuracy scalar)
         """
         device = router_logits[0].device
         gold_indices = gold_indices.to(device)
@@ -221,7 +227,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         # Stack layers -> (B, S, L, E)
         logits = torch.stack([r.view(batch_size, seq_len, -1) for r in router_logits], dim=2)
-        gold_indices = gold_indices.permute(0, 2, 1, 3).contiguous()  # (B, S, L, K)
+        gold_indices_bslk = gold_indices.permute(0, 2, 1, 3).contiguous()  # (B, S, L, K)
 
         # Top-k from model per (B,S,L)
         _, topk_idx = torch.topk(logits.detach(), k=top_k, dim=-1)  # (B, S, L, K)
@@ -231,7 +237,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         in_model_topk.scatter_(-1, topk_idx, True)
 
         in_gold_topk = torch.zeros_like(logits, dtype=torch.bool)
-        in_gold_topk.scatter_(-1, gold_indices.long(), True)
+        in_gold_topk.scatter_(-1, gold_indices_bslk.long(), True)
 
         # Loss components along expert dimension
         loss_missing = -((in_gold_topk & ~in_model_topk).float() * F.softplus(logits)).sum(dim=-1)  # (B, S, L)
@@ -243,8 +249,21 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         num_valid_tokens = (num_items_in_batch or mask2d.sum().item()) * num_layers
         total_loss = token_layer_loss.sum()
         if num_valid_tokens > 0:
-            return total_loss / num_valid_tokens
-        return torch.tensor(0.0, device=device)
+            aux_loss = total_loss / num_valid_tokens
+        else:
+            aux_loss = torch.tensor(0.0, device=device)
+
+        # Router Top-K accuracy using the same masks and shapes
+        overlap = (in_model_topk & in_gold_topk).sum(dim=-1).float()  # (B, S, L)
+        acc_bsl = overlap / max(top_k, 1)
+        acc_bsl = acc_bsl * mask2d.unsqueeze(-1)
+        total_acc = acc_bsl.sum()
+        if num_valid_tokens > 0:
+            router_acc = total_acc / num_valid_tokens
+        else:
+            router_acc = torch.tensor(0.0, device=device)
+
+        return aux_loss, router_acc
 
     @override
     def prediction_step(
