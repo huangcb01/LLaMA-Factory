@@ -119,64 +119,33 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         return super()._get_train_sampler(*args, **kwargs)
 
     @override
-    def compute_loss(self, model, inputs, return_outputs: bool = False):
+    def compute_loss(self, model, inputs, return_outputs: bool = False, num_items_in_batch: Optional[int] = None):
         # Detect split by model mode
         split = "train" if model.training else "eval"
-
+        gold_indices = inputs.pop("gold_router_indices")
+        inputs["output_router_logits"] = True
+        inputs["return_dict"] = True
+        if self.model_accepts_loss_kwargs and num_items_in_batch is not None:
+            inputs["num_items_in_batch"] = num_items_in_batch
+            loss_log_multiplier = self.args.gradient_accumulation_steps
+        else:
+            loss_log_multiplier = 1.0
+        outputs = model(**inputs)
+        loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
+        self._stored_metrics[split]["lm_loss"].append(loss.detach().float().mean().item() * loss_log_multiplier)
         if self.finetuning_args.moe_router_loss_weight > 0.0:
-            inputs["output_router_logits"] = True
-            outputs = model(**inputs)
-            lm_loss = outputs.loss if hasattr(outputs, "loss") else outputs[0]
-            gold_indices = inputs.pop("gold_router_indices")
-            # Build a robust 2D mask from labels when available; fallback to 2D attention_mask
-            mask2d = None
-            labels = inputs.get("labels", None)
-            if labels is not None and labels.dim() == 2:
-                mask2d = (labels != IGNORE_INDEX).float()
-            else:
-                am = inputs.get("attention_mask", None)
-                if am is not None and am.dim() == 2:
-                    mask2d = am.float()
-
             aux_loss = self._compute_gold_router_aux_loss_from_indices(
                 outputs.router_logits,
                 gold_indices,
-                mask2d,
+                inputs["attention_mask"],
+                num_items_in_batch
             )
-            # total loss = lm + weight * aux
-            loss = lm_loss + self.finetuning_args.moe_router_loss_weight * aux_loss
-
-            # store per-step metrics for later logging (with ddp reduction)
-            try:
-                self._stored_metrics[split]["lm_loss"].append(lm_loss.detach().float().mean().item())
-                self._stored_metrics[split]["gold_router_aux_loss"].append(aux_loss.detach().float().mean().item())
-                self._stored_metrics[split]["total_loss"].append(loss.detach().float().mean().item())
-            except Exception:
-                # best-effort; don't break training on logging issues
-                pass
-            if return_outputs:
-                return loss, outputs
-            return loss
-        else:
-            # no aux router loss; still log lm (equals total)
-            if return_outputs:
-                base_loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
-                try:
-                    val = base_loss.detach().float().mean().item()
-                    self._stored_metrics[split]["lm_loss"].append(val)
-                    self._stored_metrics[split]["total_loss"].append(val)
-                except Exception:
-                    pass
-                return base_loss, outputs
-            else:
-                base_loss = super().compute_loss(model, inputs, return_outputs=False)
-                try:
-                    val = base_loss.detach().float().mean().item()
-                    self._stored_metrics[split]["lm_loss"].append(val)
-                    self._stored_metrics[split]["total_loss"].append(val)
-                except Exception:
-                    pass
-                return base_loss
+            loss = loss + self.finetuning_args.moe_router_loss_weight * aux_loss
+            self._stored_metrics[split]["gold_router_aux_loss"].append(aux_loss.detach().float().mean().item() * loss_log_multiplier)
+            self._stored_metrics[split]["total_loss"].append(loss.detach().float().mean().item() * loss_log_multiplier)
+        if return_outputs:
+            return loss, outputs
+        return loss
 
     @override
     def log(self, logs: dict[str, float], *args, **kwargs) -> None:
@@ -228,7 +197,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         self,
         router_logits: tuple,
         gold_indices: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor,
+        num_items_in_batch: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Compute auxiliary loss based on gold router activated expert indices.
@@ -268,15 +238,9 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         loss_extra = -((~in_gold_topk & in_model_topk).float() * F.softplus(-logits)).sum(dim=-1)  # (B, S, L)
         token_layer_loss = loss_missing + loss_extra  # (B, S, L)
 
-        # Mask PAD tokens using 2D attention mask
-        if attention_mask is not None:
-            mask2d = attention_mask.float()  # expected shape (B, S)
-            token_layer_loss = token_layer_loss * mask2d.unsqueeze(-1)  # (B, S, L)
-            num_valid_tokens = mask2d.sum().item() * num_layers
-        else:
-            logger.warning_rank0("No 2D attention mask provided; using all tokens (including padding) for aux loss.")
-            num_valid_tokens = float(batch_size * seq_len * num_layers)
-
+        mask2d = attention_mask.float()  # expected shape (B, S)
+        token_layer_loss = token_layer_loss * mask2d.unsqueeze(-1)  # (B, S, L)
+        num_valid_tokens = (num_items_in_batch or mask2d.sum().item()) * num_layers
         total_loss = token_layer_loss.sum()
         if num_valid_tokens > 0:
             return total_loss / num_valid_tokens
