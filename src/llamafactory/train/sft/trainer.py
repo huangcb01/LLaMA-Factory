@@ -240,8 +240,8 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
         in_gold_topk.scatter_(-1, gold_indices_bslk.long(), True)
 
         # Loss components along expert dimension
-        loss_missing = -((in_gold_topk & ~in_model_topk).float() * F.softplus(logits)).sum(dim=-1)  # (B, S, L)
-        loss_extra = -((~in_gold_topk & in_model_topk).float() * F.softplus(-logits)).sum(dim=-1)  # (B, S, L)
+        loss_missing = ((in_gold_topk & ~in_model_topk).float() * F.softplus(-logits)).sum(dim=-1)  # (B, S, L)
+        loss_extra = ((~in_gold_topk & in_model_topk).float() * F.softplus(logits)).sum(dim=-1)  # (B, S, L)
         token_layer_loss = loss_missing + loss_extra  # (B, S, L)
 
         mask2d = attention_mask.float()  # expected shape (B, S)
