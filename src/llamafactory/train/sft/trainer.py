@@ -246,7 +246,7 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
 
         mask2d = attention_mask.float()  # expected shape (B, S)
         token_layer_loss = token_layer_loss * mask2d.unsqueeze(-1)  # (B, S, L)
-        num_valid_tokens = (num_items_in_batch or mask2d.sum().item()) * num_layers
+        num_valid_tokens = mask2d.sum().item() * num_layers
         total_loss = token_layer_loss.sum()
         if num_valid_tokens > 0:
             aux_loss = total_loss / num_valid_tokens
