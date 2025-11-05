@@ -184,6 +184,7 @@ def _load_single_dataset(
                     add_logits,
                     batched=True,
                     with_indices=True,
+                    num_proc=data_args.preprocessing_num_workers,
                 )
                 logger.info_rank0(f"Added gold router logits to dataset '{dataset_name}' at load stage.")
         except Exception as e:
@@ -221,6 +222,7 @@ def _get_merged_dataset(
             dataset = dataset.map(
                 add_metadata,
                 with_indices=True,
+                num_proc=data_args.preprocessing_num_workers
             )
 
         datasets[dataset_name] = dataset

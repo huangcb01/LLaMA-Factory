@@ -139,11 +139,13 @@ class CustomSeq2SeqTrainer(Seq2SeqTrainer):
                 gold_logits,
                 inputs["attention_mask"],
             )
+            if split == "train" and self.model_accepts_loss_kwargs and num_items_in_batch is not None:
+                aux_loss /= self.args.gradient_accumulation_steps
             loss = loss + self.finetuning_args.moe_router_loss_weight * aux_loss
             self._stored_metrics[split]["gold_router_aux_loss"].append(aux_loss.detach().float().mean().item() * loss_log_multiplier)
             self._stored_metrics[split]["total_loss"].append(loss.detach().float().mean().item() * loss_log_multiplier)
             self._stored_metrics[split]["router_topk_acc"].append(
-                router_acc.detach().float().mean().item() * loss_log_multiplier
+                router_acc.detach().float().mean().item()
             )
         if return_outputs:
             return loss, outputs
