@@ -95,8 +95,47 @@ def gen_loss_plot(trainer_log: list[dict[str, Any]]) -> "matplotlib.figure.Figur
     return fig
 
 
+def _collect_series_from_trainer_state(data: dict[str, Any], key: str) -> tuple[list[int], list[float]]:
+    steps: list[int] = []
+    metrics: list[float] = []
+    for i in range(len(data["log_history"])):
+        if key in data["log_history"][i]:
+            steps.append(data["log_history"][i]["step"])
+            metrics.append(data["log_history"][i][key])
+    return steps, metrics
+
+
+def _plot_single_metric(save_dictionary: str, data: dict[str, Any], key: str) -> None:
+    """Plot a single metric to its own image file.
+
+    The figure is saved as metric_{key}.png under save_dictionary.
+    """
+    if not is_matplotlib_available():
+        return
+
+    steps, values = _collect_series_from_trainer_state(data, key)
+    if len(values) == 0:
+        logger.warning_rank0(f"No metric {key} to plot.")
+        return
+
+    plt.switch_backend("agg")
+    plt.figure()
+    plt.plot(steps, values, alpha=0.25, label=f"{key} (raw)")
+    plt.plot(steps, smooth(values), label=f"{key}")
+    plt.title(f"{key} of {save_dictionary}")
+    plt.xlabel("step")
+    plt.ylabel(key)
+    plt.legend()
+    figure_path = os.path.join(save_dictionary, f"metric_{key}.png")
+    plt.savefig(figure_path, format="png", dpi=100)
+    print("Figure saved at:", figure_path)
+
+
 def plot_loss(save_dictionary: str, keys: list[str] = ["loss", "lm_loss", "gold_router_aux_loss"]) -> None:
-    r"""Plot multiple loss curves on one image and save it.
+    r"""Plot only loss-related curves on one image; non-loss metrics are drawn separately.
+
+    - Loss group (single figure): loss, lm_loss, gold_router_aux_loss, total_loss (if available)
+    - Other requested keys: each plotted to its own figure as metric_{key}.png
 
     Falls back gracefully for missing keys.
     """
@@ -104,39 +143,44 @@ def plot_loss(save_dictionary: str, keys: list[str] = ["loss", "lm_loss", "gold_
     with open(os.path.join(save_dictionary, TRAINER_STATE_NAME), encoding="utf-8") as f:
         data = json.load(f)
 
-    # collect metrics
+    # Partition requested keys into loss vs non-loss
+    loss_key_set = {"loss", "lm_loss", "gold_router_aux_loss", "total_loss"}
+    requested_set = set(keys)
+    non_loss_keys = sorted(list(requested_set - loss_key_set))
+    # Always include total_loss if present in logs, even if not requested explicitly
+    keys_for_loss_plot = [k for k in ["loss", "lm_loss", "gold_router_aux_loss", "total_loss"] if k in requested_set or k == "total_loss"]
+
+    # collect loss metrics only
     series: dict[str, tuple[list[int], list[float]]] = {}
-    for key in keys:
-        steps, metrics = [], []
-        for i in range(len(data["log_history"])):
-            if key in data["log_history"][i]:
-                steps.append(data["log_history"][i]["step"])
-                metrics.append(data["log_history"][i][key])
-        if len(metrics) == 0:
-            logger.warning_rank0(f"No metric {key} to plot.")
-            continue
-        series[key] = (steps, metrics)
+    for key in keys_for_loss_plot:
+        steps, metrics = _collect_series_from_trainer_state(data, key)
+        if len(metrics) > 0:
+            series[key] = (steps, metrics)
 
     if len(series) == 0:
-        logger.warning_rank0("No metrics available to plot.")
-        return
+        logger.warning_rank0("No loss metrics available to plot.")
+    else:
+        # make a single figure with multiple lines (loss-only)
+        plt.figure()
+        color_map = {
+            "loss": "#1f77b4",
+            "lm_loss": "#2ca02c",
+            "gold_router_aux_loss": "#d62728",
+            "total_loss": "#ff7f0e",
+        }
+        for key, (steps, metrics) in series.items():
+            color = color_map.get(key, None)
+            plt.plot(steps, metrics, color=color, alpha=0.25, label=f"{key} (raw)")
+            plt.plot(steps, smooth(metrics), color=color, label=f"{key}")
 
-    # make a single figure with multiple lines
-    plt.figure()
-    color_map = {
-        "loss": "#1f77b4",
-        "lm_loss": "#2ca02c",
-        "gold_router_aux_loss": "#d62728",
-    }
-    for key, (steps, metrics) in series.items():
-        color = color_map.get(key, None)
-        plt.plot(steps, metrics, color=color, alpha=0.25, label=f"{key} (raw)")
-        plt.plot(steps, smooth(metrics), color=color, label=f"{key}")
+        plt.title(f"training losses of {save_dictionary}")
+        plt.xlabel("step")
+        plt.ylabel("loss")
+        plt.legend()
+        figure_path = os.path.join(save_dictionary, "training_losses.png")
+        plt.savefig(figure_path, format="png", dpi=100)
+        print("Figure saved at:", figure_path)
 
-    plt.title(f"training losses of {save_dictionary}")
-    plt.xlabel("step")
-    plt.ylabel("loss")
-    plt.legend()
-    figure_path = os.path.join(save_dictionary, "training_losses.png")
-    plt.savefig(figure_path, format="png", dpi=100)
-    print("Figure saved at:", figure_path)
+    # Plot each non-loss metric separately (if requested)
+    for key in non_loss_keys:
+        _plot_single_metric(save_dictionary, data, key)
