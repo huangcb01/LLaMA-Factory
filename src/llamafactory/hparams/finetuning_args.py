@@ -489,6 +489,16 @@ class FinetuningArguments(
         default=0.0,
         metadata={"help": "The weight of the MoE router loss if using gold router top-k."},
     )
+    moe_router_loss_type: Literal["set", "kl"] = field(
+        default="set",
+        metadata={
+            "help": (
+                "Router auxiliary loss type when using gold routing supervision. "
+                "'set' uses the original Top-K set-based softplus loss, "
+                "'kl' minimizes KL(Q||P) via cross-entropy where Q is uniform on gold Top-K experts."
+            )
+        },
+    )
     freeze_vision_tower: bool = field(
         default=True,
         metadata={"help": "Whether ot not to freeze the vision tower in MLLM training."},

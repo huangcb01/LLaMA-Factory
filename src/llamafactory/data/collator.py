@@ -108,7 +108,7 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, "torch.Tensor"]:
         batch_images, batch_videos, batch_audios = [], [], []
         batch_imglens, batch_vidlens, batch_audlens, batch_input_ids = [], [], [], []
-        gold_router_indices_per_sample: list[Optional[torch.Tensor]] = []
+        gold_router_logits_per_sample: list[Optional[torch.Tensor]] = []
 
         for feature in features:
             images = feature.pop("images", None) or []
@@ -119,19 +119,12 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
             dataset_name = feature.pop("_dataset_name", None)
             sample_idx = feature.pop("_sample_idx", None)
 
-            # Try to use pre-attached gold router indices column first
-            gold_col = feature.pop("gold_router_indices", None)
-            gold_tensor: Optional[torch.Tensor] = None
-            if gold_col is not None:
-                try:
-                    if isinstance(gold_col, np.ndarray):
-                        gold_tensor = torch.from_numpy(gold_col).to(torch.long)
-                    else:
-                        gold_tensor = torch.tensor(gold_col, dtype=torch.long)
-                except Exception:
-                    gold_tensor = None
-
-            gold_router_indices_per_sample.append(gold_tensor)
+            # Try to use pre-attached gold router signals
+            gold_logits_col = feature.pop("gold_router_logits", None)
+            logits_tensor: Optional[torch.Tensor] = None
+            if gold_logits_col is not None:
+                logits_tensor = torch.from_numpy(gold_logits_col).to(torch.float32)
+            gold_router_logits_per_sample.append(logits_tensor)
 
             batch_images.extend(images)
             batch_videos.extend(videos)
@@ -254,28 +247,27 @@ class MultiModalDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
 
         features.update(mm_inputs)
 
-        # Add gold router indices if available: pad/truncate per-sample to batch max length
-        if any(t is not None for t in gold_router_indices_per_sample):
+        # Add gold router logits if available: pad/truncate per-sample to batch max length
+        if any(t is not None for t in gold_router_logits_per_sample):
             max_len = features["input_ids"].size(1)
-            batch_tensors: list[torch.Tensor] = []
-            for t in gold_router_indices_per_sample:
-                if t is None:
+            batch_logits: list[torch.Tensor] = []
+            for lg in gold_router_logits_per_sample:
+                if lg is None:
                     raise ValueError(
-                        "gold_router_indices is required for all samples when moe_router_loss is enabled."
+                        "gold_router_logits is required for all samples when KL router loss is enabled."
                     )
-                # t: [num_layers, seq_len, top_k]
-                num_layers, seq_len, top_k = t.shape
+                # lg: [num_layers, seq_len, num_experts]
+                num_layers, seq_len, num_experts = lg.shape
                 if seq_len > max_len:
-                    t = t[:, :max_len, :]
+                    lg = lg[:, :max_len, :]
                     seq_len = max_len
                 if seq_len < max_len:
-                    padded = t.new_zeros((num_layers, max_len, top_k))
-                    padded[:, :seq_len, :] = t
-                    t = padded
-                batch_tensors.append(t)
-
-            # Stack: [batch_size, num_layers, max_len, top_k]
-            features["gold_router_indices"] = torch.stack(batch_tensors, dim=0)
+                    padded = lg.new_zeros((num_layers, max_len, num_experts))
+                    padded[:, :seq_len, :] = lg
+                    lg = padded
+                batch_logits.append(lg)
+            # Stack: [batch, num_layers, max_len, num_experts]
+            features["gold_router_logits"] = torch.stack(batch_logits, dim=0)
 
         if "image_bound" in features:  # for minicpmv inputs
             bsz, seq_length = features["input_ids"].shape

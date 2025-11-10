@@ -164,31 +164,30 @@ def _load_single_dataset(
     # Align to standard format first (no reordering expected)
     dataset = align_dataset(dataset, dataset_attr, data_args, training_args)
 
-    # Add gold router activated expert indices per sample if available and not streaming
-    # We attach indices here at single-dataset granularity to avoid ambiguity after merging.
+    # Add gold router FULL logits per sample if available and not streaming
+    # We attach logits here at single-dataset granularity to avoid ambiguity after merging.
     if (not data_args.streaming) and dataset_name is not None:
         try:
             from .gold_router_loader import get_gold_router_loader
 
             loader = get_gold_router_loader()
-            if loader is not None and loader.has_gold_indices(dataset_name):
-                def add_indices(examples, indices):
-                    gold_indices_list = []
+            if loader is not None and loader.has_gold_logits(dataset_name):
+                def add_logits(examples, indices):
+                    gold_logits_list = []
                     for idx in indices:
-                        inds = loader.get_sample_indices(dataset_name, idx)
-                        # store as numpy array if available, else None to keep alignment
-                        gold_indices_list.append(None if inds is None else inds.numpy())
-                    examples["gold_router_indices"] = gold_indices_list
+                        logits = loader.get_sample_logits(dataset_name, idx)
+                        gold_logits_list.append(None if logits is None else logits.numpy())
+                    examples["gold_router_logits"] = gold_logits_list
                     return examples
 
                 dataset = dataset.map(
-                    add_indices,
+                    add_logits,
                     batched=True,
                     with_indices=True,
                 )
-                logger.info_rank0(f"Added gold router indices to dataset '{dataset_name}' at load stage.")
+                logger.info_rank0(f"Added gold router logits to dataset '{dataset_name}' at load stage.")
         except Exception as e:
-            logger.warning_rank0(f"Failed to add gold router indices for '{dataset_name}': {e}")
+            logger.warning_rank0(f"Failed to add gold router logits for '{dataset_name}': {e}")
 
     return dataset
 
@@ -300,7 +299,7 @@ def _get_preprocessed_dataset(
         )
 
     # Preserve special columns added earlier
-    for special_col in ["gold_router_indices"]:
+    for special_col in ["gold_router_indices", "gold_router_logits"]:
         if special_col in column_names:
             column_names.remove(special_col)
 
